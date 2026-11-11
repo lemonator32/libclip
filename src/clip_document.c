@@ -47,6 +47,27 @@ static const uint8_t *col_blob(sqlite3_stmt *s, const char *name, size_t *size) 
     return (const uint8_t *)p;
 }
 
+static uint32_t rd_be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
+
+/* Decodes the EffectEdge section of a LayerEffectInfo blob (docs/FORMAT.md
+ * §4.4.1).  It is the first section in every observed blob; anything else
+ * leaves the border off. */
+static void parse_effect_info(const uint8_t *b, size_t n, clip_layer_effects *fx) {
+    static const char name[] = "EffectEdge";
+    const size_t len = sizeof name - 1, body = 8 + 4 + 2 * (sizeof name - 1);
+    const uint8_t *e = b + body;
+    union { double d; uint64_t u; } width;
+    size_t k;
+    if (!b || n < body + 24 || rd_be32(b) != n || rd_be32(b + 8) != len) return;
+    for (k = 0; k < len; ++k)
+        if (b[12 + 2 * k] != 0 || b[13 + 2 * k] != (uint8_t)name[k]) return;
+    width.u = 0;
+    for (k = 0; k < 8; ++k) width.u = width.u << 8 | e[4 + k];
+    fx->border = rd_be32(e) != 0;
+    fx->border_width = width.d;
+    for (k = 0; k < 3; ++k) fx->border_color[k] = (uint8_t)rd_be32(e + 12 + 4 * k);
+}
+
 /* Prepares "SELECT * FROM <table> WHERE MainId=<id>" and steps to the row. */
 static sqlite3_stmt *row_by_id(sqlite3 *db, const char *table, int64_t id) {
     char sql[128];
@@ -241,6 +262,16 @@ static int read_layers(clip_document *doc, clip_error *err) {
         l.draw_color[1] = chan(s, "DrawColorMainGreen");
         l.draw_color[2] = chan(s, "DrawColorMainBlue");
         l.draw_color[3] = 255;
+        l.effects.expression_color = (int32_t)col_i64(s, "LayerColorTypeIndex", 0);
+        l.effects.layer_color = col_i64(s, "LayerUsePaletteColor", 0) != 0;
+        l.effects.layer_color_rgb[0] = (uint8_t)col_i64(s, "LayerPaletteRed", 0);
+        l.effects.layer_color_rgb[1] = (uint8_t)col_i64(s, "LayerPaletteGreen", 0);
+        l.effects.layer_color_rgb[2] = (uint8_t)col_i64(s, "LayerPaletteBlue", 0);
+        {
+            size_t fx_size;
+            const uint8_t *fx = col_blob(s, "LayerEffectInfo", &fx_size);
+            parse_effect_info(fx, fx_size, &l.effects);
+        }
         if (!l.name || !l.uuid) {
             free_layer(&l);
             ok = 0;

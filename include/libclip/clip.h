@@ -264,6 +264,24 @@ typedef enum clip_composite {
     CLIP_COMPOSITE_LUMINOSITY = 19
 } clip_composite;
 
+/* Layer.LayerColorTypeIndex: the layer's "Expression color".  It also
+ * decides how the layer's pixels are stored (BGRx, gray, or 1-bit). */
+typedef enum clip_expression_color {
+    CLIP_EXPRESSION_COLOR = 0,
+    CLIP_EXPRESSION_GRAY = 1,
+    CLIP_EXPRESSION_MONOCHROME = 2   /* read only; the writer rejects it */
+} clip_expression_color;
+
+/* Layer Property effects.  Zero-initialised means "no effects, color". */
+typedef struct clip_layer_effects {
+    int border;                  /* "Border effect": LayerEffectInfo / EffectEdge */
+    double border_width;         /* pixels (CSP's UI may show mm; the file stores px) */
+    uint8_t border_color[3];     /* RGB */
+    int layer_color;             /* "Layer color": LayerUsePaletteColor */
+    uint8_t layer_color_rgb[3];  /* LayerPaletteRed/Green/Blue */
+    int32_t expression_color;    /* clip_expression_color */
+} clip_layer_effects;
+
 typedef struct clip_layer_info {
     int64_t main_id;             /* Layer.MainId (used by tree links) */
     int64_t canvas_id;
@@ -286,6 +304,7 @@ typedef struct clip_layer_info {
     int depth;                   /* nesting depth computed from the tree */
     int draw_color_enable;       /* fill layers ("Paper") */
     uint8_t draw_color[4];       /* RGBA */
+    clip_layer_effects effects;
 } clip_layer_info;
 
 CLIP_API int clip_layer_is_paper(const clip_layer_info *l);
@@ -355,6 +374,9 @@ typedef struct clip_write_layer {
     int visible, locked, clip;
     int32_t opacity;             /* 0..256 */
     int32_t composite;           /* clip_composite */
+    /* Border, layer color and expression color.  A GRAY layer is stored as
+     * gray (luma of `pixels`), as CSP does; COLOR and GRAY are writable. */
+    clip_layer_effects effects;
 } clip_write_layer;
 
 typedef struct clip_write_document {

@@ -317,6 +317,52 @@ reference file **[unknown]**.
   is accepted **[tested]**.
 * `LayerColorType*` appear on raster layers only.
 
+#### 4.4.1 Layer Property effects [observed]
+
+Surveyed over 693 CSP-saved files (10 000+ layer rows).
+
+* **Expression color**: `LayerColorTypeIndex` 0 = Color, 1 = Gray,
+  2 = Monochrome. `LayerColorTypeBlackChecked/WhiteChecked` are the
+  Monochrome "black/white" toggles; libclip writes 1/1. The index also sets
+  the storage of **every mipmap level**: Color uses channel order 33
+  (alpha + BGRx, §5.3), Gray uses channel order 17 with packing
+  `17 1 1 2 65536 1 256 1 256 65536 256 256 8 8 0 0`: a tile inflates to an
+  alpha plane followed by one gray plane (2 bytes/px). Gray is 0 under
+  transparent pixels. Monochrome uses a 1-bit packing (`17 1 1 1 8192 …`)
+  that libclip does not write. The layer thumbnail stays order 33.
+* **Layer color**: `LayerUsePaletteColor` 1 enables it;
+  `LayerPaletteRed/Green/Blue` hold the colour with the 8-bit value repeated
+  in all four bytes (`0x78787878`; white is `0xFFFFFFFF`).
+  `LayerNoticeablePaletteColor` was 0 in every file.
+* **`LayerEffectAttached INTEGER DEFAULT NULL`, `LayerEffectInfo BLOB
+  DEFAULT NULL`** are **not** in the base `Layer` table: CSP appends this
+  pair with `ALTER TABLE` the first time a layer in the document gets an
+  effect (70 of 639 surveyed files). `LayerEffectAttached` is 1 next to a
+  blob (or NULL in older files); both are NULL on layers whose effects were
+  never touched. The `ParamScheme` row for `LayerEffectInfo` is always
+  present.
+* **`LayerEffectInfo`**: Always **610, 602 or 598 bytes**, version 2:
+
+  ```
+  u32 totalSize, u32 2
+  ustr "EffectEdge"          24-byte payload (no size word)
+  ustr "EffectTone"          76 bytes      ┐
+  ustr "EffectTextureMap"    16 bytes      │ each payload starts with its
+  ustr "EffectApplyOpacity"   8 bytes      │ own u32 size (except where
+  ustr "EffectToneAreaColor" 16 bytes      │ noted)
+  ustr "EffectTonePosterize" 28 bytes      │
+  ustr "EffectWaterEdge"     40 bytes      │
+  ustr "EffectLine"          116 bytes + 0/4/12-byte tail (CSP version) ┘
+  ```
+
+  The **border effect** is `EffectEdge`: `u32 enabled`, `f64 width` in
+  pixels (e.g. 3.0, 1.0, 7.09), then `u32 red, green, blue` with the byte
+  repeated in all four bytes. The other sections hold the tone, watercolor
+  edge and line-extraction settings, whose layouts are **[unknown]**.
+  libclip writes the 610-byte blob that CSP most often wrote for a layer
+  with a border, patching only `EffectEdge`, and writes NULL when the border
+  is off. Whether CSP opens such files is **[untested]**.
+
 ### 4.5 `Mipmap`, `MipmapInfo`, `Offscreen`
 
 * `Mipmap(MainId, CanvasId, LayerId, MipmapCount, BaseMipmapInfo)`:
@@ -579,13 +625,15 @@ original. Both CSP and libclip's reader open it.
 
 ## 10. Unknowns and open questions
 
+* **Layer effects:** the payloads of `EffectTone`, `EffectWaterEdge`,
+  `EffectLine` and the other non-border sections of `LayerEffectInfo`.
 * **Layer kinds:** `LayerType` values for vector, text, gradient, tone,
   adjustment and 3-D layers; the formats of `VectorObjectList.VectorData`
   and the other external columns.
 * **Layer masks:** `LayerLayerMaskMipmap` should follow §5. The mask tile
   layout (likely alpha-only) has not been seen in a real file.
-* **Other colour modes:** channel orders other than 33 (grey, monochrome,
-  16-bit, CMYK), and `CanvasUnit` values other than 0.
+* **Other colour modes:** the 1-bit monochrome packing (§4.4.1) and
+  16-bit and CMYK channel orders, and `CanvasUnit` values other than 0.
 * **Blend modes:** the `LayerComposite` numbering beyond 0 = Normal.
 * **Unexplained fields:** `BlockStatus`, `LayerMasking` (32 on the root),
   the `Thumbnail*NeedRefresh*` counters, the two reserved packing words, the

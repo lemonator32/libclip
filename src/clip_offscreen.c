@@ -17,6 +17,9 @@ static const char kEnd[] = "BlockDataEndChunk";
 
 /* Packing values written by CSP 5.1 for 8-bit RGBA ("channel order 33"). */
 static const uint32_t kPackingRgba[16] = {33, 1, 4, 5, 65536, 4, 1024, 1, 256, 65536, 256, 256, 8, 8, 0, 0};
+/* ... and for the mipmaps of a layer whose expression color is Gray ("channel
+ * order 17": alpha plane + one gray plane).  Observed on 2 769 offscreens. */
+static const uint32_t kPackingGray[16] = {17, 1, 1, 2, 65536, 1, 256, 1, 256, 65536, 256, 256, 8, 8, 0, 0};
 
 const char *clip_packing_name(size_t i) {
     static const char *names[16] = {"BlockDataChannelOrder",          "BlockDataChannelBytes",
@@ -363,12 +366,13 @@ fail:
 /* ---- encoding -------------------------------------------------------------- */
 
 static int write_attribute(uint32_t w, uint32_t h, uint32_t bcx, uint32_t bcy, const uint32_t *block_sizes, size_t nblocks,
-                           int paper_fill, clip_buffer *attribute) {
+                           int paper_fill, int gray, clip_buffer *attribute) {
     clip_buffer param = {0}, init = {0}, bs = {0}, attr = {0};
+    const uint32_t *packing = gray ? kPackingGray : kPackingRgba;
     size_t i;
     int ok = clip__buf_ustr(&param, "Parameter") && clip__buf_u32be(&param, w) && clip__buf_u32be(&param, h) &&
              clip__buf_u32be(&param, bcx) && clip__buf_u32be(&param, bcy);
-    for (i = 0; ok && i < 16; ++i) ok = clip__buf_u32be(&param, kPackingRgba[i]);
+    for (i = 0; ok && i < 16; ++i) ok = clip__buf_u32be(&param, packing[i]);
     ok = ok && clip__buf_ustr(&init, "InitColor") && clip__buf_u32be(&init, 20) &&
          clip__buf_u32be(&init, paper_fill ? 1 : 0) &&            /* DoInitialize */
          clip__buf_u32be(&init, paper_fill ? 0xFFFFFFFFu : 0) &&  /* AlphaValue */
@@ -390,10 +394,12 @@ static int write_attribute(uint32_t w, uint32_t h, uint32_t bcx, uint32_t bcy, c
     return ok;
 }
 
-static int encode_impl(const clip_image *img, uint32_t w, uint32_t h, int store_data, int paper_fill, clip_buffer *attribute,
-                       clip_buffer *blocks, clip_error *err) {
+int clip__offscreen_encode_ex(const clip_image *img, uint32_t w, uint32_t h, int paper_fill, int gray, clip_buffer *attribute,
+                              clip_buffer *blocks, clip_error *err) {
+    const int store_data = img != NULL;
     const uint32_t bcx = (w + K_BLOCK - 1) / K_BLOCK, bcy = (h + K_BLOCK - 1) / K_BLOCK;
     const size_t px = (size_t)K_BLOCK * K_BLOCK, nblocks = (size_t)bcx * bcy;
+    const size_t tile_bytes = px * (gray ? 2 : 5);
     uint8_t *tile = NULL;
     uint32_t *block_sizes = NULL, *checksums = NULL;
     clip_buffer bd = {0}, blk = {0}, z = {0};
@@ -401,7 +407,7 @@ static int encode_impl(const clip_image *img, uint32_t w, uint32_t h, int store_
     size_t i, nb = 0;
     int ok = 1;
 
-    tile = (uint8_t *)clip__malloc(px * 5);
+    tile = (uint8_t *)clip__malloc(tile_bytes);
     block_sizes = (uint32_t *)clip__malloc(sizeof(uint32_t) * (nblocks ? nblocks : 1));
     checksums = (uint32_t *)clip__malloc(sizeof(uint32_t) * (nblocks ? nblocks : 1));
     if (!tile || !block_sizes || !checksums) ok = 0;
@@ -410,7 +416,28 @@ static int encode_impl(const clip_image *img, uint32_t w, uint32_t h, int store_
         for (bx = 0; ok && bx < bcx; ++bx) {
             uint32_t index = by * bcx + bx, x, y, size;
             int any = 0;
-            if (store_data) {
+            if (store_data && gray) {
+                /* Alpha plane + gray plane.  CSP stores gray 0 under transparent
+                 * pixels and Rec. 601 luma elsewhere. */
+                memset(tile, 0, px * 2);
+                for (y = 0; y < K_BLOCK; ++y) {
+                    int cy = (int)(by * K_BLOCK + y);
+                    const uint8_t *src;
+                    if (cy >= img->height) break;
+                    src = img->pixels + (size_t)cy * img->width * 4;
+                    for (x = 0; x < K_BLOCK; ++x) {
+                        int cx = (int)(bx * K_BLOCK + x);
+                        const uint8_t *c;
+                        size_t k = (size_t)y * K_BLOCK + x;
+                        if (cx >= img->width) break;
+                        c = src + (size_t)cx * 4;
+                        if (!c[3]) continue;
+                        tile[k] = c[3];
+                        tile[px + k] = (uint8_t)((c[0] * 299u + c[1] * 587u + c[2] * 114u + 500u) / 1000u);
+                        any = 1;
+                    }
+                }
+            } else if (store_data) {
                 /* Alpha plane transparent, image plane white with 4th byte 255 (as CSP writes it). */
                 memset(tile, 0, px);
                 memset(tile + px, 255, px * 4);
@@ -444,11 +471,11 @@ static int encode_impl(const clip_image *img, uint32_t w, uint32_t h, int store_
                 }
             }
             blk.size = 0;
-            ok = clip__buf_ustr(&blk, kBegin) && clip__buf_u32be(&blk, index) && clip__buf_u32be(&blk, (uint32_t)(px * 5)) &&
+            ok = clip__buf_ustr(&blk, kBegin) && clip__buf_u32be(&blk, index) && clip__buf_u32be(&blk, (uint32_t)tile_bytes) &&
                  clip__buf_u32be(&blk, K_BLOCK) && clip__buf_u32be(&blk, K_BLOCK);
             if (ok && any) {
                 size_t payload_at;
-                ok = clip_zlib_deflate(tile, px * 5, 6, &z) && clip__buf_u32be(&blk, 1) &&
+                ok = clip_zlib_deflate(tile, tile_bytes, 6, &z) && clip__buf_u32be(&blk, 1) &&
                      clip__buf_u32be(&blk, (uint32_t)(z.size + 4)) /* big-endian payload length */;
                 payload_at = blk.size;
                 ok = ok && clip__buf_u32le(&blk, (uint32_t)z.size) /* little-endian zlib length */ &&
@@ -473,7 +500,7 @@ static int encode_impl(const clip_image *img, uint32_t w, uint32_t h, int store_
     ok = ok && clip__buf_ustr(&bd, "BlockCheckSum") && clip__buf_u32be(&bd, 12) && clip__buf_u32be(&bd, (uint32_t)nb) &&
          clip__buf_u32be(&bd, 4);
     for (i = 0; ok && i < nb; ++i) ok = clip__buf_u32be(&bd, checksums[i]);
-    ok = ok && write_attribute(w, h, bcx, bcy, block_sizes, nb, paper_fill, attribute);
+    ok = ok && write_attribute(w, h, bcx, bcy, block_sizes, nb, paper_fill, gray, attribute);
     if (ok) clip__buf_move(blocks, &bd);
 
     free(tile);
@@ -486,10 +513,10 @@ static int encode_impl(const clip_image *img, uint32_t w, uint32_t h, int store_
 }
 
 int clip_offscreen_encode(const clip_image *img, clip_buffer *attribute, clip_buffer *blocks, clip_error *err) {
-    return encode_impl(img, (uint32_t)img->width, (uint32_t)img->height, 1, 0, attribute, blocks, err);
+    return clip__offscreen_encode_ex(img, (uint32_t)img->width, (uint32_t)img->height, 0, 0, attribute, blocks, err);
 }
 
 int clip_offscreen_encode_empty(uint32_t width, uint32_t height, int paper_fill, clip_buffer *attribute, clip_buffer *blocks,
                                 clip_error *err) {
-    return encode_impl(NULL, width, height, 0, paper_fill, attribute, blocks, err);
+    return clip__offscreen_encode_ex(NULL, width, height, paper_fill, 0, attribute, blocks, err);
 }

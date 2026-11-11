@@ -193,7 +193,8 @@ static int64_t add_offscreen(writer *w, int64_t layer_id, const clip_buffer *att
 
 /* Five-level mipmap chain (100, 50, 25, 12.5, 6.25 %).  Only the base level
  * carries pixels; CSP regenerates the rest.  Returns Mipmap.MainId. */
-static int64_t add_mipmap(writer *w, int64_t layer_id, const clip_image *pixels, uint32_t width, uint32_t height, int paper_fill) {
+static int64_t add_mipmap(writer *w, int64_t layer_id, const clip_image *pixels, uint32_t width, uint32_t height, int paper_fill,
+                          int gray) {
     /* CSP gives a layer's Mipmap row the layer's own MainId (observed). */
     int64_t mipmap_id = layer_id, info_ids[5];
     double scale = 100.0;
@@ -209,7 +210,9 @@ static int64_t add_mipmap(writer *w, int64_t layer_id, const clip_image *pixels,
         int64_t off;
         if (lw < 1) lw = 1;
         if (lh < 1) lh = 1;
-        ok = store ? clip_offscreen_encode(pixels, &attr, &blocks, &e) : clip_offscreen_encode_empty(lw, lh, paper_fill, &attr, &blocks, &e);
+        /* A Gray layer stores every level as alpha + gray (observed). */
+        ok = clip__offscreen_encode_ex(store ? pixels : NULL, store ? (uint32_t)pixels->width : lw, store ? (uint32_t)pixels->height : lh,
+                                       paper_fill, gray, &attr, &blocks, &e);
         if (!ok) {
             set_err(w, e.message);
             return 0;
@@ -371,6 +374,74 @@ static int monochrome_fill_info(clip_buffer *b) {
            clip__buf_u32be(b, 0) && clip__buf_u32be(b, 0) && clip__buf_u32be(b, 1);
 }
 
+/* LayerEffectInfo (docs/FORMAT.md §4.4.1).  u32 total size, u32 version 2,
+ * then named sections (u32 length in UTF-16 units, UTF-16BE name, payload) in
+ * a fixed order: EffectEdge, EffectTone, EffectTextureMap, EffectApplyOpacity,
+ * EffectToneAreaColor, EffectTonePosterize, EffectWaterEdge, EffectLine.
+ * The template is the blob CSP 5.1 writes most often for a layer with a border
+ * (16 layers in 9 files); only EffectEdge is patched.  Its 24-byte payload is
+ * u32 enabled, f64 width in px, then u32 red/green/blue with the 8-bit value
+ * replicated into all four bytes. */
+static const uint8_t kEffectInfoTemplate[610] = {
+    0x00, 0x00, 0x02, 0x62, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x45, 0x00, 0x66,
+    0x00, 0x66, 0x00, 0x65, 0x00, 0x63, 0x00, 0x74, 0x00, 0x45, 0x00, 0x64, 0x00, 0x67, 0x00, 0x65,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x45, 0x00, 0x66,
+    0x00, 0x66, 0x00, 0x65, 0x00, 0x63, 0x00, 0x74, 0x00, 0x54, 0x00, 0x6f, 0x00, 0x6e, 0x00, 0x65,
+    0x00, 0x00, 0x00, 0x00, 0x40, 0x72, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x40, 0x4e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2d, 0x00, 0x00, 0x00, 0x1e,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+    0x00, 0x45, 0x00, 0x66, 0x00, 0x66, 0x00, 0x65, 0x00, 0x63, 0x00, 0x74, 0x00, 0x54, 0x00, 0x65,
+    0x00, 0x78, 0x00, 0x74, 0x00, 0x75, 0x00, 0x72, 0x00, 0x65, 0x00, 0x4d, 0x00, 0x61, 0x00, 0x70,
+    0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1e, 0x80, 0x80, 0x80, 0x80,
+    0x00, 0x00, 0x00, 0x12, 0x00, 0x45, 0x00, 0x66, 0x00, 0x66, 0x00, 0x65, 0x00, 0x63, 0x00, 0x74,
+    0x00, 0x41, 0x00, 0x70, 0x00, 0x70, 0x00, 0x6c, 0x00, 0x79, 0x00, 0x4f, 0x00, 0x70, 0x00, 0x61,
+    0x00, 0x63, 0x00, 0x69, 0x00, 0x74, 0x00, 0x79, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01,
+    0x00, 0x00, 0x00, 0x13, 0x00, 0x45, 0x00, 0x66, 0x00, 0x66, 0x00, 0x65, 0x00, 0x63, 0x00, 0x74,
+    0x00, 0x54, 0x00, 0x6f, 0x00, 0x6e, 0x00, 0x65, 0x00, 0x41, 0x00, 0x72, 0x00, 0x65, 0x00, 0x61,
+    0x00, 0x43, 0x00, 0x6f, 0x00, 0x6c, 0x00, 0x6f, 0x00, 0x72, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00,
+    0x00, 0x6f, 0x00, 0x00, 0x00, 0xd7, 0x00, 0x00, 0x00, 0xf1, 0x00, 0x00, 0x00, 0x13, 0x00, 0x45,
+    0x00, 0x66, 0x00, 0x66, 0x00, 0x65, 0x00, 0x63, 0x00, 0x74, 0x00, 0x54, 0x00, 0x6f, 0x00, 0x6e,
+    0x00, 0x65, 0x00, 0x50, 0x00, 0x6f, 0x00, 0x73, 0x00, 0x74, 0x00, 0x65, 0x00, 0x72, 0x00, 0x69,
+    0x00, 0x7a, 0x00, 0x65, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+    0x00, 0x00, 0x00, 0x3c, 0x00, 0x00, 0x00, 0x32, 0x00, 0x00, 0x00, 0x78, 0x00, 0x00, 0x00, 0x1e,
+    0x00, 0x00, 0x00, 0x0f, 0x00, 0x45, 0x00, 0x66, 0x00, 0x66, 0x00, 0x65, 0x00, 0x63, 0x00, 0x74,
+    0x00, 0x57, 0x00, 0x61, 0x00, 0x74, 0x00, 0x65, 0x00, 0x72, 0x00, 0x45, 0x00, 0x64, 0x00, 0x67,
+    0x00, 0x65, 0x00, 0x00, 0x00, 0x28, 0x00, 0x00, 0x00, 0x00, 0x40, 0x14, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x40, 0x49, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x34, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x40, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x45,
+    0x00, 0x66, 0x00, 0x66, 0x00, 0x65, 0x00, 0x63, 0x00, 0x74, 0x00, 0x4c, 0x00, 0x69, 0x00, 0x6e,
+    0x00, 0x65, 0x00, 0x00, 0x00, 0x74, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xf0, 0xf0,
+    0xf0, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x0f, 0x40, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x14,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
+    0x00, 0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00,
+    0x00, 0x40, 0x00, 0x00, 0x00, 0x4b, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x32, 0x00, 0x00,
+    0x00, 0xc0, 0x00, 0x00, 0x00, 0x19, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+    0x00, 0xc8,
+};
+#define EFFECT_EDGE_PAYLOAD 32 /* offset of the EffectEdge payload in the template */
+
+static uint32_t rep8(uint8_t v) { return (uint32_t)v * 0x01010101u; }
+
+static void put_be32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
+}
+
+static void layer_effect_info(const clip_layer_effects *fx, uint8_t out[sizeof kEffectInfoTemplate]) {
+    uint8_t *e = out + EFFECT_EDGE_PAYLOAD;
+    union { double d; uint64_t u; } width;
+    int k;
+    memcpy(out, kEffectInfoTemplate, sizeof kEffectInfoTemplate);
+    width.d = fx->border_width;
+    put_be32(e, fx->border ? 1 : 0);
+    for (k = 0; k < 8; ++k) e[4 + k] = (uint8_t)(width.u >> (56 - 8 * k));
+    for (k = 0; k < 3; ++k) put_be32(e + 12 + 4 * k, rep8(fx->border_color[k]));
+}
+
 /* Comic-story columns shared by the Canvas and Project rows. */
 static void put_comic_story(row *r) {
     put(r, ct("ComicStoryStoryName", ""));
@@ -458,6 +529,7 @@ static int build(writer *w, const clip_write_document *doc) {
     int64_t *ids = (int64_t *)clip__malloc(sizeof(int64_t) * (n ? n : 1));
     int64_t current_layer;
     char uuid[37];
+    uint8_t effect_blob[sizeof kEffectInfoTemplate];
     row r;
     size_t i;
 
@@ -468,6 +540,14 @@ static int build(writer *w, const clip_write_document *doc) {
     for (i = 0; i < n; ++i) ids[i] = w->next_layer++;
 
     write_schema(w);
+    /* CSP adds the effect columns to Layer only once a layer uses an effect
+     * (70 of 639 surveyed files have them), always as this pair at the end. */
+    for (i = 0; i < n; ++i)
+        if (doc->layers[i].effects.border) {
+            exec_sql(w, "ALTER TABLE Layer ADD COLUMN LayerEffectAttached INTEGER DEFAULT NULL");
+            exec_sql(w, "ALTER TABLE Layer ADD COLUMN LayerEffectInfo BLOB DEFAULT NULL");
+            break;
+        }
 
     /* ---- layers ----
      * Bottom-up order in the file: the root's first child is the bottom-most
@@ -485,7 +565,7 @@ static int build(writer *w, const clip_write_document *doc) {
             break;
         }
         clip__image_blit(&padded, px, 0, 0);
-        mip = add_mipmap(w, ids[i], &padded, pad_w, pad_h, 0);
+        mip = add_mipmap(w, ids[i], &padded, pad_w, pad_h, 0, l->effects.expression_color == CLIP_EXPRESSION_GRAY);
         thumb = add_thumbnail(w, ids[i], px, 0, NULL);
         clip_image_free(&padded);
         clip_image_free(&tmp);
@@ -503,13 +583,27 @@ static int build(writer *w, const clip_write_document *doc) {
         f.thumb = thumb;
         layer_common(w, &r, &f, uuid);
         {
+            const clip_layer_effects *fx = &l->effects;
             int k;
-            for (k = 0; k < r.n; ++k)
+            for (k = 0; k < r.n; ++k) {
                 if (strcmp(r.c[k].name, "LayerSelect") == 0) r.c[k].i = i == doc->active_layer ? 1 : 0;
+                /* "Layer color": CSP stores each channel replicated into 4 bytes. */
+                else if (strcmp(r.c[k].name, "LayerUsePaletteColor") == 0) r.c[k].i = fx->layer_color ? 1 : 0;
+                else if (strcmp(r.c[k].name, "LayerPaletteRed") == 0) r.c[k].i = fx->layer_color ? rep8(fx->layer_color_rgb[0]) : 0;
+                else if (strcmp(r.c[k].name, "LayerPaletteGreen") == 0) r.c[k].i = fx->layer_color ? rep8(fx->layer_color_rgb[1]) : 0;
+                else if (strcmp(r.c[k].name, "LayerPaletteBlue") == 0) r.c[k].i = fx->layer_color ? rep8(fx->layer_color_rgb[2]) : 0;
+            }
+            /* Expression color; "BlackChecked/WhiteChecked" are 1/1 for Color and Gray. */
+            put(&r, ci("LayerColorTypeIndex", fx->expression_color == CLIP_EXPRESSION_GRAY ? 1 : 0));
+            put(&r, ci("LayerColorTypeBlackChecked", 1));
+            put(&r, ci("LayerColorTypeWhiteChecked", 1));
+            /* Only written when a border is set, like CSP: a NULL column means "never touched". */
+            if (fx->border) {
+                layer_effect_info(fx, effect_blob);
+                put(&r, ci("LayerEffectAttached", 1));
+                put(&r, cb("LayerEffectInfo", effect_blob, sizeof effect_blob));
+            }
         }
-        put(&r, ci("LayerColorTypeIndex", 0));
-        put(&r, ci("LayerColorTypeBlackChecked", 1));
-        put(&r, ci("LayerColorTypeWhiteChecked", 1));
         insert(w, "Layer", &r);
     }
     if (paper_id && !w->err[0]) {
@@ -517,7 +611,7 @@ static int build(writer *w, const clip_write_document *doc) {
         int white = pc[0] == 255 && pc[1] == 255 && pc[2] == 255;
         clip_buffer mono = {0};
         layer_fields f;
-        int64_t mip = add_mipmap(w, paper_id, NULL, (uint32_t)doc->width, (uint32_t)doc->height, 1);
+        int64_t mip = add_mipmap(w, paper_id, NULL, (uint32_t)doc->width, (uint32_t)doc->height, 1, 0);
         int64_t thumb = add_thumbnail(w, paper_id, NULL, 1, pc);
         memset(&f, 0, sizeof f);
         f.id = paper_id;
@@ -548,7 +642,7 @@ static int build(writer *w, const clip_write_document *doc) {
     }
     if (!w->err[0]) {
         layer_fields f;
-        int64_t mip = add_mipmap(w, root_id, NULL, (uint32_t)doc->width, (uint32_t)doc->height, 0);
+        int64_t mip = add_mipmap(w, root_id, NULL, (uint32_t)doc->width, (uint32_t)doc->height, 0, 0);
         int64_t thumb = add_thumbnail(w, root_id, NULL, 0, NULL);
         memset(&f, 0, sizeof f);
         f.id = root_id;
@@ -717,6 +811,13 @@ int clip_write_memory(const clip_write_document *doc, clip_buffer *out, clip_err
     out->size = 0;
     if (!doc || doc->width <= 0 || doc->height <= 0) return clip__fail(err, "document has no size");
     if (doc->layer_count && !doc->layers) return clip__fail(err, "layer_count set without layers");
+    for (i = 0; i < doc->layer_count; ++i) {
+        const clip_layer_effects *fx = &doc->layers[i].effects;
+        if (fx->expression_color != CLIP_EXPRESSION_COLOR && fx->expression_color != CLIP_EXPRESSION_GRAY)
+            return clip__fail(err, "layer %u: only Color and Gray expression colors can be written", (unsigned)i);
+        if (fx->border && !(fx->border_width > 0.0 && fx->border_width <= 1000.0))
+            return clip__fail(err, "layer %u: border width out of range", (unsigned)i);
+    }
 
     memset(&w, 0, sizeof w);
     w.next_offset = 24 + 16 + 40; /* header + CHNKHead chunk */

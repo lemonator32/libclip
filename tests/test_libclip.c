@@ -343,6 +343,83 @@ static void test_write_then_read(void) {
     clip_image_free(&out);
 }
 
+static void test_layer_effects(void) {
+    clip_image ink, out = {0, 0, NULL};
+    clip_write_layer layers[2];
+    clip_write_document doc;
+    clip_buffer file = {0};
+    clip_document *cd = NULL;
+    clip_error err;
+    clip_offscreen_attribute attr;
+    const clip_layer_info *l;
+    int x, y;
+
+    CHECK(clip_image_init(&ink, 300, 300));
+    for (y = 20; y < 80; ++y)
+        for (x = 20; x < 280; ++x) px(&ink, x, y, 200, 40, 10, 255);
+    memset(layers, 0, sizeof layers);
+    memset(&attr, 0, sizeof attr);
+    layers[0].name = "Bordered"; layers[0].pixels = ink; layers[0].visible = 1; layers[0].opacity = 256;
+    layers[0].effects.border = 1;
+    layers[0].effects.border_width = 3.5;
+    layers[0].effects.border_color[0] = 0x12; layers[0].effects.border_color[1] = 0x34; layers[0].effects.border_color[2] = 0x56;
+    layers[0].effects.layer_color = 1;
+    layers[0].effects.layer_color_rgb[0] = 40; layers[0].effects.layer_color_rgb[1] = 120; layers[0].effects.layer_color_rgb[2] = 230;
+    layers[1].name = "Gray"; layers[1].pixels = ink; layers[1].visible = 1; layers[1].opacity = 256;
+    layers[1].effects.expression_color = CLIP_EXPRESSION_GRAY;
+    memset(&doc, 0, sizeof doc);
+    doc.width = doc.height = 300;
+    doc.dpi = 72;
+    doc.layers = layers;
+    doc.layer_count = 2;
+
+    if (!clip_write_memory(&doc, &file, &err)) {
+        printf("  write: %s\n", err.message);
+        CHECK(0);
+    }
+    CHECK(clip_document_open_memory(&cd, file.data, file.size, &err));
+    if (!cd) {
+        printf("  %s\n", err.message);
+        clip_image_free(&ink);
+        clip_buffer_free(&file);
+        return;
+    }
+    l = clip_document_layer(cd, 1); /* top-down: Gray, Bordered */
+    CHECK(strcmp(l->name, "Bordered") == 0);
+    CHECK(l->effects.border && l->effects.border_width == 3.5);
+    CHECK(l->effects.border_color[0] == 0x12 && l->effects.border_color[1] == 0x34 && l->effects.border_color[2] == 0x56);
+    CHECK(l->effects.layer_color && l->effects.layer_color_rgb[0] == 40 && l->effects.layer_color_rgb[2] == 230);
+    CHECK_EQ_U(l->effects.expression_color, CLIP_EXPRESSION_COLOR);
+    l = clip_document_layer(cd, 0);
+    CHECK(strcmp(l->name, "Gray") == 0);
+    CHECK(!l->effects.border && !l->effects.layer_color);
+    CHECK_EQ_U(l->effects.expression_color, CLIP_EXPRESSION_GRAY);
+    /* The gray layer is stored as alpha + gray, and decodes to its luma. */
+    CHECK(clip_document_layer_attribute(cd, l, &attr, &err));
+    CHECK_EQ_U(attr.packing[0], 17);
+    CHECK(clip_document_render_layer(cd, l, &out, &err));
+    CHECK(at(&out, 50, 50)[0] == 84 && at(&out, 50, 50)[1] == 84 && at(&out, 50, 50)[3] == 255); /* .299*200+.587*40+.114*10 */
+    CHECK(at(&out, 150, 150)[3] == 0);
+    CHECK_EQ_U(clip_document_row_count(cd, "Layer"), 3);
+    {
+        rows r;
+        memset(&r, 0, sizeof r);
+        CHECK(clip_document_query(cd, "SELECT length(LayerEffectInfo) FROM Layer WHERE LayerEffectInfo IS NOT NULL", -1, collect, &r, &err));
+        CHECK_EQ_U(r.count, 1);
+        CHECK(strcmp(r.first[0], "610") == 0);
+    }
+
+    /* Monochrome is not writable. */
+    layers[1].effects.expression_color = CLIP_EXPRESSION_MONOCHROME;
+    CHECK(!clip_write_memory(&doc, &file, &err));
+
+    clip_offscreen_attribute_free(&attr);
+    clip_document_close(cd);
+    clip_buffer_free(&file);
+    clip_image_free(&ink);
+    clip_image_free(&out);
+}
+
 static void test_reference_document(void) {
     clip_document *cd = NULL;
     clip_error err;
@@ -388,6 +465,7 @@ int main(int argc, char **argv) {
         {"container_roundtrip", test_container_roundtrip},
         {"offscreen_encode_decode", test_offscreen_encode_decode},
         {"write_then_read", test_write_then_read},
+        {"layer_effects", test_layer_effects},
         {"reference_document", test_reference_document},
     };
     size_t i;
