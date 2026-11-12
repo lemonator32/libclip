@@ -1,5 +1,6 @@
 /* Reader for .clip documents: canvas properties, the layer tree and layer
  * pixels, via the SQLite database embedded in CHNKSQLi. */
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -92,13 +93,19 @@ const char *clip_layer_type_name(int32_t t) {
 
 int clip_layer_is_paper(const clip_layer_info *l) { return (l->type & 0x630) == 0x630; }
 int clip_layer_is_folder(const clip_layer_info *l) { return l->folder || (l->type & 0x100) != 0; }
+int clip_layer_mask_enabled(const clip_layer_info *l) { return l->mask_mipmap && (l->type & 0x2) && (l->masking & 0x1); }
+int clip_layer_is_filter(const clip_layer_info *l) { return l->filter_info != NULL && l->filter_info_size >= 8; }
 
 /* ---- open / close ---------------------------------------------------------- */
 
 static void free_layer(clip_layer_info *l) {
     free(l->name);
     free(l->uuid);
+    free(l->filter_info);
+    free(l->gradation_info);
     l->name = l->uuid = NULL;
+    l->filter_info = l->gradation_info = NULL;
+    l->filter_info_size = l->gradation_info_size = 0;
 }
 
 void clip_document_close(clip_document *doc) {
@@ -138,10 +145,30 @@ static int read_canvas(clip_document *doc, clip_error *err) {
         return clip__fail(err, "Canvas table is empty");
     }
     c->main_id = col_i64(s, "MainId", 0);
-    c->width = col_f64(s, "CanvasWidth", 0);
-    c->height = col_f64(s, "CanvasHeight", 0);
+    c->unit_width = col_f64(s, "CanvasWidth", 0);
+    c->unit_height = col_f64(s, "CanvasHeight", 0);
     c->resolution = col_f64(s, "CanvasResolution", 72);
     c->unit = (int32_t)col_i64(s, "CanvasUnit", 0);
+    {
+        /* Pages made from a print preset store their size in mm or inches.
+         * CSP's pixel size is the rounded product with the resolution; this
+         * matches the full-canvas offscreens of every sample file. */
+        double per_inch;
+        switch (c->unit) {
+            case 1: per_inch = 2.54; break;
+            case 2: per_inch = 25.4; break;
+            case 3: per_inch = 1.0; break;
+            case 4: per_inch = 72.0; break;
+            default: per_inch = 0; break;
+        }
+        if (per_inch > 0 && c->resolution > 0) {
+            c->width = floor(c->unit_width / per_inch * c->resolution + 0.5);
+            c->height = floor(c->unit_height / per_inch * c->resolution + 0.5);
+        } else {
+            c->width = c->unit_width;
+            c->height = c->unit_height;
+        }
+    }
     c->channel_bytes = (int32_t)col_i64(s, "CanvasChannelBytes", 1);
     c->default_channel_order = (int32_t)col_i64(s, "CanvasDefaultChannelOrder", 0);
     c->root_folder = col_i64(s, "CanvasRootFolder", 0);
@@ -150,10 +177,16 @@ static int read_canvas(clip_document *doc, clip_error *err) {
     return 1;
 }
 
-static uint8_t chan(sqlite3_stmt *s, const char *name) {
-    int64_t v = col_i64(s, name, 255);
-    return (uint8_t)(v < 0 || v > 255 ? 255 : v);
+/* CSP stores colour channels as 32 bits: a 16-bit value repeated twice
+ * (0x983A983A is 0x983A / 65535 = 152 / 255; 0xFFFFFFFF is white).  Values
+ * 0..255 are accepted as plain 8-bit channels, as older libclip wrote them. */
+static uint8_t chan_value(int64_t v) {
+    if (v < 0) return 255;
+    if (v <= 255) return (uint8_t)v;
+    return (uint8_t)((((uint64_t)v >> 16 & 0xFFFF) * 255 + 32767) / 65535);
 }
+
+static uint8_t chan(sqlite3_stmt *s, const char *name) { return chan_value(col_i64(s, name, 255)); }
 
 static int cmp_layer_id(const void *a, const void *b) {
     int64_t x = ((const clip_layer_info *)a)->main_id, y = ((const clip_layer_info *)b)->main_id;
@@ -185,6 +218,18 @@ static int emit_layer(clip_document *doc, const clip_layer_info *src, int depth,
     l->depth = depth;
     l->name = clip__strdup(src->name);
     l->uuid = clip__strdup(src->uuid);
+    l->filter_info = NULL;
+    if (src->filter_info) {
+        l->filter_info = (uint8_t *)clip__malloc(src->filter_info_size);
+        if (l->filter_info) memcpy(l->filter_info, src->filter_info, src->filter_info_size);
+        else l->filter_info_size = 0;
+    }
+    l->gradation_info = NULL;
+    if (src->gradation_info) {
+        l->gradation_info = (uint8_t *)clip__malloc(src->gradation_info_size);
+        if (l->gradation_info) memcpy(l->gradation_info, src->gradation_info, src->gradation_info_size);
+        else l->gradation_info_size = 0;
+    }
     if (!l->name || !l->uuid) {
         free_layer(l);
         return 0;
@@ -240,7 +285,8 @@ static int read_layers(clip_document *doc, clip_error *err) {
         l.canvas_id = col_i64(s, "CanvasId", 0);
         l.name = col_text(s, "LayerName");
         l.type = (int32_t)col_i64(s, "LayerType", 0);
-        l.visible = col_i64(s, "LayerVisibility", 1) != 0;
+        /* Bit 0 is the layer's eye; bit 1 belongs to its mask (2 = hidden, masked). */
+        l.visible = (col_i64(s, "LayerVisibility", 1) & 1) != 0;
         l.locked = col_i64(s, "LayerLock", 0) != 0;
         l.clip = col_i64(s, "LayerClip", 0) != 0;
         l.masking = (int32_t)col_i64(s, "LayerMasking", 0);
@@ -250,7 +296,7 @@ static int read_layers(clip_document *doc, clip_error *err) {
         l.render_offset_y = (int32_t)col_i64(s, "LayerRenderOffscrOffsetY", 0);
         l.opacity = (int32_t)col_i64(s, "LayerOpacity", 256);
         l.composite = (int32_t)col_i64(s, "LayerComposite", 0);
-        l.folder = col_i64(s, "LayerFolder", 0) != 0;
+        l.folder = (int)col_i64(s, "LayerFolder", 0); /* 1 = folder; bit 0x10 = shown open */
         l.next_index = col_i64(s, "LayerNextIndex", 0);
         l.first_child_index = col_i64(s, "LayerFirstChildIndex", 0);
         l.render_mipmap = col_i64(s, "LayerRenderMipmap", 0);
@@ -263,14 +309,37 @@ static int read_layers(clip_document *doc, clip_error *err) {
         l.draw_color[2] = chan(s, "DrawColorMainBlue");
         l.draw_color[3] = 255;
         l.effects.expression_color = (int32_t)col_i64(s, "LayerColorTypeIndex", 0);
+        l.mono_black = col_i64(s, "LayerColorTypeBlackChecked", 1) != 0;
+        l.mono_white = col_i64(s, "LayerColorTypeWhiteChecked", 1) != 0;
+        {
+            size_t gi_size;
+            const uint8_t *gi = col_blob(s, "GradationFillInfo", &gi_size);
+            if (gi && gi_size >= 8 && (l.gradation_info = (uint8_t *)clip__malloc(gi_size)) != NULL) {
+                memcpy(l.gradation_info, gi, gi_size);
+                l.gradation_info_size = gi_size;
+            }
+        }
         l.effects.layer_color = col_i64(s, "LayerUsePaletteColor", 0) != 0;
-        l.effects.layer_color_rgb[0] = (uint8_t)col_i64(s, "LayerPaletteRed", 0);
-        l.effects.layer_color_rgb[1] = (uint8_t)col_i64(s, "LayerPaletteGreen", 0);
-        l.effects.layer_color_rgb[2] = (uint8_t)col_i64(s, "LayerPaletteBlue", 0);
+        l.effects.layer_color_rgb[0] = chan_value(col_i64(s, "LayerPaletteRed", 0));
+        l.effects.layer_color_rgb[1] = chan_value(col_i64(s, "LayerPaletteGreen", 0));
+        l.effects.layer_color_rgb[2] = chan_value(col_i64(s, "LayerPaletteBlue", 0));
         {
             size_t fx_size;
             const uint8_t *fx = col_blob(s, "LayerEffectInfo", &fx_size);
             parse_effect_info(fx, fx_size, &l.effects);
+        }
+        l.mask_offset_x = (int32_t)(col_i64(s, "LayerMaskOffsetX", 0) + col_i64(s, "LayerMaskOffscrOffsetX", 0));
+        l.mask_offset_y = (int32_t)(col_i64(s, "LayerMaskOffsetY", 0) + col_i64(s, "LayerMaskOffscrOffsetY", 0));
+        if (l.type & 0x1000) {
+            size_t fi_size;
+            const uint8_t *fi = col_blob(s, "FilterLayerInfo", &fi_size);
+            if (fi && fi_size >= 8) {
+                l.filter_info = (uint8_t *)clip__malloc(fi_size);
+                if (l.filter_info) {
+                    memcpy(l.filter_info, fi, fi_size);
+                    l.filter_info_size = fi_size;
+                }
+            }
         }
         if (!l.name || !l.uuid) {
             free_layer(&l);
@@ -397,8 +466,16 @@ static int render_offscreen_row(const clip_document *doc, int64_t offscreen_id, 
         sqlite3_finalize(s);
         return 0;
     }
-    /* BlockData holds the external chunk id as text. */
     ref = col_blob(s, "BlockData", &ref_size);
+    if (ref_size > CLIP_EXTERNAL_ID_LEN + 1 || (ref_size >= 8 && memcmp(ref, "extrnlid", 8) != 0)) {
+        /* Legacy .lip: BlockData holds the tile stream itself. */
+        ok = clip_offscreen_data_parse(ref, ref_size, &data, err) && clip_offscreen_decode(&attr, &data, out, NULL, err);
+        sqlite3_finalize(s);
+        clip_offscreen_data_free(&data);
+        clip_offscreen_attribute_free(&attr);
+        return ok;
+    }
+    /* .clip: BlockData holds the external chunk id as text. */
     while (ref_size && ref[ref_size - 1] == '\0') --ref_size;
     if (ref_size > CLIP_EXTERNAL_ID_LEN) ref_size = CLIP_EXTERNAL_ID_LEN;
     if (ref_size) memcpy(id, ref, ref_size);
@@ -432,9 +509,34 @@ int clip_document_render_layer(const clip_document *doc, const clip_layer_info *
 
 int clip_document_render_layer_mask(const clip_document *doc, const clip_layer_info *layer, clip_image *out, clip_error *err) {
     int64_t off;
+    clip_image tile = {0, 0, NULL};
+    uint8_t outside[4] = {0, 0, 0, 0};
+    clip_offscreen_attribute attr;
     clip_image_free(out);
     if (!offscreen_for_mipmap(doc, layer->mask_mipmap, &off, err)) return 0;
-    return render_offscreen_row(doc, off, out, err);
+    if (!render_offscreen_row(doc, off, &tile, err)) return 0;
+    /* Canvas-sized, placed like the layer pixels.  Outside the offscreen the
+     * mask has its InitColor (usually "show"). */
+    memset(&attr, 0, sizeof attr);
+    {
+        sqlite3_stmt *s = row_by_id(doc->db, "Offscreen", off);
+        size_t n;
+        const uint8_t *blob = s ? col_blob(s, "Attribute", &n) : NULL;
+        if (blob && clip_offscreen_attribute_parse(blob, n, &attr, NULL)) clip_offscreen_init_color(&attr, outside);
+        clip_offscreen_attribute_free(&attr);
+        if (s) sqlite3_finalize(s);
+    }
+    if (!clip_image_init(out, (int)doc->canvas.width, (int)doc->canvas.height)) {
+        clip_image_free(&tile);
+        return clip__fail(err, "out of memory");
+    }
+    if (outside[3]) {
+        size_t i, n = (size_t)out->width * out->height;
+        for (i = 0; i < n; ++i) memcpy(out->pixels + i * 4, outside, 4);
+    }
+    clip__image_blit(out, &tile, layer->mask_offset_x, layer->mask_offset_y);
+    clip_image_free(&tile);
+    return 1;
 }
 
 int clip_document_layer_attribute(const clip_document *doc, const clip_layer_info *layer, clip_offscreen_attribute *out,

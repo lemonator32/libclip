@@ -119,6 +119,7 @@ typedef struct clip_container {
     uint64_t head_sqlite_offset;   /* CHNKHead: file offset of the CHNKSQLi chunk */
     uint8_t document_guid[16];     /* CHNKHead */
     int has_guid;
+    int bare_sqlite;               /* legacy .lip: the file is a SQLite database with no CSFCHUNK framing */
     clip_chunk *chunks;
     size_t chunk_count;
 } clip_container;
@@ -178,6 +179,10 @@ typedef struct clip_offscreen_attribute {
 
 CLIP_API int clip_offscreen_attribute_parse(const uint8_t *blob, size_t size, clip_offscreen_attribute *out, clip_error *err);
 CLIP_API void clip_offscreen_attribute_free(clip_offscreen_attribute *a);
+/* The colour of blocks that have no data (the "InitColor" section), as
+ * RGBA.  Returns 0, with rgba zeroed (transparent), when the offscreen does
+ * not initialise its blocks. */
+CLIP_API int clip_offscreen_init_color(const clip_offscreen_attribute *attr, uint8_t rgba[4]);
 CLIP_API uint32_t clip_offscreen_block_width(const clip_offscreen_attribute *a);
 CLIP_API uint32_t clip_offscreen_block_height(const clip_offscreen_attribute *a);
 CLIP_API const char *clip_packing_name(size_t index);
@@ -188,7 +193,8 @@ typedef enum clip_pixel_layout {
     CLIP_LAYOUT_GRAY_ALPHA,
     CLIP_LAYOUT_BGRX_ALPHA,
     CLIP_LAYOUT_BGRA,
-    CLIP_LAYOUT_CMYK_ALPHA
+    CLIP_LAYOUT_CMYK_ALPHA,
+    CLIP_LAYOUT_MONO_1BIT            /* monochrome layers: 1 bit/pixel ink mask */
 } clip_pixel_layout;
 CLIP_API const char *clip_pixel_layout_name(clip_pixel_layout layout);
 
@@ -239,8 +245,11 @@ CLIP_API int clip_offscreen_encode_empty(uint32_t width, uint32_t height, int pa
 #define CLIP_LAYER_TYPE_PAPER  0x630
 CLIP_API const char *clip_layer_type_name(int32_t type);
 
-/* LayerComposite codes (blend modes) as used by libclip's reader and
- * writer.  Codes 4, 9 and 10 are the least certain of the mapping. */
+/* LayerComposite codes (blend modes): the position in CSP's blend-mode menu.
+ * Calibrated against the canvas previews of 693 CSP-saved files: Multiply
+ * (2), Color Burn (3), Screen (8), Color Dodge (9), Add (11), Overlay (14)
+ * and Hard Light (16) were measured; the others follow the menu order.
+ * 30 ("Through", pass-through) occurs on folders only. */
 typedef enum clip_composite {
     CLIP_COMPOSITE_NORMAL = 0,
     CLIP_COMPOSITE_DARKEN = 1,
@@ -248,20 +257,29 @@ typedef enum clip_composite {
     CLIP_COMPOSITE_COLOR_BURN = 3,
     CLIP_COMPOSITE_LINEAR_BURN = 4,
     CLIP_COMPOSITE_SUBTRACT = 5,
-    CLIP_COMPOSITE_LIGHTEN = 6,
-    CLIP_COMPOSITE_SCREEN = 7,
-    CLIP_COMPOSITE_COLOR_DODGE = 8,
-    CLIP_COMPOSITE_ADD = 9,
-    CLIP_COMPOSITE_ADD_GLOW = 10,
-    CLIP_COMPOSITE_OVERLAY = 11,
-    CLIP_COMPOSITE_SOFT_LIGHT = 12,
-    CLIP_COMPOSITE_HARD_LIGHT = 13,
-    CLIP_COMPOSITE_DIFFERENCE = 14,
-    CLIP_COMPOSITE_EXCLUSION = 15,
-    CLIP_COMPOSITE_HUE = 16,
-    CLIP_COMPOSITE_SATURATION = 17,
-    CLIP_COMPOSITE_COLOR = 18,
-    CLIP_COMPOSITE_LUMINOSITY = 19
+    CLIP_COMPOSITE_DARKER_COLOR = 6,
+    CLIP_COMPOSITE_LIGHTEN = 7,
+    CLIP_COMPOSITE_SCREEN = 8,
+    CLIP_COMPOSITE_COLOR_DODGE = 9,
+    CLIP_COMPOSITE_GLOW_DODGE = 10,
+    CLIP_COMPOSITE_ADD = 11,
+    CLIP_COMPOSITE_ADD_GLOW = 12,
+    CLIP_COMPOSITE_LIGHTER_COLOR = 13,
+    CLIP_COMPOSITE_OVERLAY = 14,
+    CLIP_COMPOSITE_SOFT_LIGHT = 15,
+    CLIP_COMPOSITE_HARD_LIGHT = 16,
+    CLIP_COMPOSITE_VIVID_LIGHT = 17,
+    CLIP_COMPOSITE_LINEAR_LIGHT = 18,
+    CLIP_COMPOSITE_PIN_LIGHT = 19,
+    CLIP_COMPOSITE_HARD_MIX = 20,
+    CLIP_COMPOSITE_DIFFERENCE = 21,
+    CLIP_COMPOSITE_EXCLUSION = 22,
+    CLIP_COMPOSITE_HUE = 23,
+    CLIP_COMPOSITE_SATURATION = 24,
+    CLIP_COMPOSITE_COLOR = 25,
+    CLIP_COMPOSITE_LUMINOSITY = 26,
+    CLIP_COMPOSITE_DIVIDE = 27,
+    CLIP_COMPOSITE_THROUGH = 30
 } clip_composite;
 
 /* Layer.LayerColorTypeIndex: the layer's "Expression color".  It also
@@ -294,7 +312,7 @@ typedef struct clip_layer_info {
     int32_t render_offset_x, render_offset_y;   /* LayerRenderOffscrOffsetX/Y */
     int32_t opacity;             /* 0..256 (256 == 100%) */
     int32_t composite;           /* LayerComposite, see clip_composite */
-    int folder;                  /* LayerFolder */
+    int folder;                  /* LayerFolder: nonzero for folders; bit 0x10 = expanded in the palette */
     int64_t next_index;          /* sibling link, 0 = none */
     int64_t first_child_index;   /* child link, 0 = none */
     int64_t render_mipmap;
@@ -305,16 +323,84 @@ typedef struct clip_layer_info {
     int draw_color_enable;       /* fill layers ("Paper") */
     uint8_t draw_color[4];       /* RGBA */
     clip_layer_effects effects;
+    int32_t mask_offset_x, mask_offset_y;       /* LayerMaskOffsetX/Y + LayerMaskOffscrOffsetX/Y */
+    /* Filter (correction) layers, LayerType 0x1000 / 0x1002: the FilterLayerInfo
+     * blob, owned by the document.  Big-endian: u32 kind, u32 parameter size,
+     * parameters.  NULL on other layers.  See CLIP_FILTER_*. */
+    uint8_t *filter_info;
+    size_t filter_info_size;
+    /* Gradient and Fill layers: the GradationFillInfo blob (owned by the
+     * document), NULL on other layers.  See clip_gradation_parse. */
+    uint8_t *gradation_info;
+    size_t gradation_info_size;
+    /* Monochrome expression color: which of black / white the layer shows
+     * (LayerColorTypeBlackChecked / WhiteChecked).  The 1-bit ink plane is
+     * drawn in white when only white is checked. */
+    int mono_black, mono_white;
 } clip_layer_info;
+
+/* ---- Gradient / Fill layers (GradationFillInfo) ----
+ * u32 total size, u32 version 2, then named sections (u32 length in UTF-16
+ * units, UTF-16BE name):
+ *   GradationData            u32 payload size, then the stop table (below)
+ *   GradationSetting         68 bytes, no size prefix: u32 shape (0 linear),
+ *                            u32 repeat, u32 anti-alias, f64 x 3 (ellipse
+ *                            scale %, scale %, angle), f64 start x, y, end x, y
+ *                            (canvas pixels)
+ *   GradationSettingAdd0001  u32 payload size, u32 single-colour fill flag,
+ *                            u32 R, G, B, u32 1
+ * The stop table (also the parameters of a gradient-map correction layer,
+ * after a u32 size) is: u32 header size 16, u32 stop size 28, u32 count,
+ * u32 16, then per stop u32 R, G, B, A (16-bit values doubled), u32 flags,
+ * u32 position (0..32768), u32 0.  Observed: linear shapes only. */
+#define CLIP_GRADIENT_MAX_STOPS 64
+typedef struct clip_gradient_stop {
+    uint8_t rgba[4];
+    double position;             /* 0..1 */
+} clip_gradient_stop;
+typedef struct clip_gradient {
+    clip_gradient_stop stops[CLIP_GRADIENT_MAX_STOPS];
+    size_t stop_count;
+    int32_t shape, repeat, antialias;
+    double ellipse[3];
+    double x0, y0, x1, y1;       /* canvas pixels */
+    int fill;                    /* "Fill" layer: one colour, fill_rgb */
+    uint8_t fill_rgb[3];
+} clip_gradient;
+/* Parse a stop table (no size prefix).  Stops are returned sorted. */
+CLIP_API int clip_gradient_stops_parse(const uint8_t *p, size_t n, clip_gradient *out, clip_error *err);
+CLIP_API int clip_gradation_parse(const uint8_t *blob, size_t size, clip_gradient *out, clip_error *err);
+/* Encode a stop table (no size prefix) / a whole GradationFillInfo blob. */
+CLIP_API int clip_gradient_stops_encode(const clip_gradient *g, clip_buffer *out);
+CLIP_API int clip_gradation_encode(const clip_gradient *g, clip_buffer *out);
+
+/* FilterLayerInfo kinds (observed in CSP 1.x-2.x files). */
+enum {
+    CLIP_FILTER_BRIGHTNESS_CONTRAST = 1, /* i32 brightness, i32 contrast (-100..100) */
+    CLIP_FILTER_LEVELS = 2,              /* 32 x 5 u16: in black, gamma point, in white, out black, out white */
+    CLIP_FILTER_TONE_CURVE = 3,          /* 32 x (u16 count, 32 x (u16 in, u16 out)) */
+    CLIP_FILTER_HSL = 4,                 /* i32 hue (degrees), i32 saturation, i32 luminosity */
+    CLIP_FILTER_COLOR_BALANCE = 5,       /* i32 preserve luminosity, 3 x 3 i32: shadows, midtones, highlights */
+    CLIP_FILTER_REVERSE_GRADIENT = 6,    /* invert; no parameters */
+    CLIP_FILTER_POSTERIZE = 7,
+    CLIP_FILTER_BINARIZE = 8,
+    CLIP_FILTER_GRADIENT_MAP = 9         /* GradationData: stops of RGBA + position */
+};
+
+/* A layer has a layer mask when its type has bit 0x2; the mask is enabled
+ * when LayerMasking has bit 0x1. */
+CLIP_API int clip_layer_mask_enabled(const clip_layer_info *l);
+CLIP_API int clip_layer_is_filter(const clip_layer_info *l);
 
 CLIP_API int clip_layer_is_paper(const clip_layer_info *l);
 CLIP_API int clip_layer_is_folder(const clip_layer_info *l);
 
 typedef struct clip_canvas_info {
     int64_t main_id;
-    double width, height;        /* pixels (unit 0) */
+    double width, height;        /* pixels, converted from `unit` */
     double resolution;
-    int32_t unit;
+    int32_t unit;                /* CanvasUnit: 0 px, 1 cm, 2 mm, 3 inch, 4 point */
+    double unit_width, unit_height; /* CanvasWidth/CanvasHeight as stored, in `unit` */
     int32_t channel_bytes;
     int32_t default_channel_order;
     int64_t root_folder;         /* Layer.MainId of the invisible root folder */
@@ -338,7 +424,9 @@ CLIP_API const clip_layer_info *clip_document_layer(const clip_document *doc, si
 /* Full-resolution raster of a layer, positioned on a canvas-sized image. */
 CLIP_API int clip_document_render_layer(const clip_document *doc, const clip_layer_info *layer, clip_image *out,
                                         clip_error *err);
-/* The layer's mask offscreen (alpha in every channel), uncropped. */
+/* The layer's mask as a canvas-sized image (mask value in every channel,
+ * 255 = shown), placed at the mask's offset.  Check clip_layer_mask_enabled
+ * first: a disabled mask is stored but not applied. */
 CLIP_API int clip_document_render_layer_mask(const clip_document *doc, const clip_layer_info *layer, clip_image *out,
                                              clip_error *err);
 /* Attribute blob of the layer's base offscreen. */
@@ -377,7 +465,28 @@ typedef struct clip_write_layer {
     /* Border, layer color and expression color.  A GRAY layer is stored as
      * gray (luma of `pixels`), as CSP does; COLOR and GRAY are writable. */
     clip_layer_effects effects;
+    /* What the layer is.  Zero-initialised: a raster layer without a mask. */
+    int32_t kind;                /* CLIP_WRITE_RASTER / _FILTER / _GRADIENT */
+    /* CLIP_WRITE_FILTER (correction layer): the FilterLayerInfo blob, see
+     * CLIP_FILTER_*.  `pixels` may be empty (CSP renders it). */
+    const uint8_t *filter_info;
+    size_t filter_info_size;
+    /* CLIP_WRITE_GRADIENT (gradient or fill layer): its settings.  Only linear
+     * gradients (shape 0) are known.  `pixels` should hold its rendering,
+     * which CSP shows until it renders the layer itself. */
+    const clip_gradient *gradient;
+    /* Optional layer mask: canvas-sized, the mask value (255 = shown) in the
+     * alpha channel.  No pixels = no mask. */
+    clip_image mask;
+    int mask_enabled;
+    /* Folders.  The list is flat and bottom-to-top, with each folder directly
+     * ABOVE its contents: the layers below it with a greater depth.  A folder
+     * has no pixels; composite CLIP_COMPOSITE_THROUGH makes it pass-through. */
+    int depth;                   /* 0 = not in a folder */
+    int expanded;                /* folder: shown open in CSP's Layer palette */
 } clip_write_layer;
+
+enum { CLIP_WRITE_RASTER = 0, CLIP_WRITE_FILTER = 1, CLIP_WRITE_GRADIENT = 2, CLIP_WRITE_FOLDER = 3 };
 
 typedef struct clip_write_document {
     int width, height;           /* canvas size in pixels */

@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "libclip/clip.h"
+#include "sqlite3.h"
 
 static int g_failures = 0;
 static const char *g_reference = NULL;
@@ -420,6 +421,106 @@ static void test_layer_effects(void) {
     clip_image_free(&out);
 }
 
+/* Legacy .lip files (CSP 1.x) are a bare SQLite database: no CSFCHUNK framing,
+ * each Offscreen.BlockData holds its tile stream inline, and print-preset pages
+ * store the canvas size in mm.  Build one from a libclip-written .clip. */
+static void test_legacy_lip(void) {
+    clip_image ink, out = {0, 0, NULL};
+    clip_write_layer layer;
+    clip_write_document doc;
+    clip_buffer file = {0};
+    clip_container c;
+    clip_document *cd = NULL;
+    clip_error err;
+    sqlite3 *db = NULL;
+    sqlite3_stmt *sel = NULL, *upd = NULL;
+    unsigned char *image, *lip;
+    const uint8_t *sq;
+    size_t sq_size;
+    sqlite3_int64 lip_size;
+    size_t i;
+    int inlined = 0;
+    /* 25.4 mm x 12.7 mm at 300 dpi = 300 x 150 px. */
+    const int w = 300, h = 150;
+
+    memset(&c, 0, sizeof c);
+    CHECK(clip_image_init(&ink, w, h));
+    px(&ink, 3, 4, 10, 20, 30, 255);
+    px(&ink, w - 1, h - 1, 200, 100, 50, 255);
+    memset(&layer, 0, sizeof layer);
+    layer.name = "Ink"; layer.pixels = ink; layer.visible = 1; layer.opacity = 256;
+    memset(&doc, 0, sizeof doc);
+    doc.width = w; doc.height = h; doc.dpi = 300;
+    doc.layers = &layer; doc.layer_count = 1;
+    CHECK(clip_write_memory(&doc, &file, &err));
+    CHECK(clip_container_parse(&c, file.data, file.size, &err));
+    sq = clip_container_sqlite(&c, &sq_size);
+    CHECK(sq != NULL);
+    if (!sq) goto done;
+
+    /* Inline every external tile stream and switch the canvas to millimetres. */
+    image = (unsigned char *)sqlite3_malloc64(sq_size);
+    memcpy(image, sq, sq_size);
+    CHECK(sqlite3_open(":memory:", &db) == SQLITE_OK);
+    CHECK(sqlite3_deserialize(db, "main", image, (sqlite3_int64)sq_size, (sqlite3_int64)sq_size,
+                              SQLITE_DESERIALIZE_FREEONCLOSE | SQLITE_DESERIALIZE_RESIZEABLE) == SQLITE_OK);
+    CHECK(sqlite3_exec(db, "DROP TRIGGER IF EXISTS ExternalUpdateOfBlockDataOnOffscreen;"
+                           "UPDATE Canvas SET CanvasUnit=2, CanvasWidth=25.4, CanvasHeight=12.7;", NULL, NULL, NULL) == SQLITE_OK);
+    CHECK(sqlite3_prepare_v2(db, "SELECT _PW_ID, BlockData FROM Offscreen", -1, &sel, NULL) == SQLITE_OK);
+    CHECK(sqlite3_prepare_v2(db, "UPDATE Offscreen SET BlockData=? WHERE _PW_ID=?", -1, &upd, NULL) == SQLITE_OK);
+    while (sel && upd && sqlite3_step(sel) == SQLITE_ROW) {
+        char id[CLIP_EXTERNAL_ID_LEN + 1] = {0};
+        int n = sqlite3_column_bytes(sel, 1);
+        const uint8_t *data;
+        size_t data_size;
+        /* Updating while stepping can revisit rows that are already inlined. */
+        if (n < 8 || memcmp(sqlite3_column_blob(sel, 1), "extrnlid", 8) != 0) continue;
+        memcpy(id, sqlite3_column_blob(sel, 1), n > CLIP_EXTERNAL_ID_LEN ? CLIP_EXTERNAL_ID_LEN : (size_t)n);
+        data = clip_container_external(&c, id, &data_size);
+        /* Offscreens the writer left without data (no chunk) stay as they are. */
+        if (!data) continue;
+        ++inlined;
+        sqlite3_bind_blob(upd, 1, data, (int)data_size, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(upd, 2, sqlite3_column_int64(sel, 0));
+        CHECK(sqlite3_step(upd) == SQLITE_DONE);
+        sqlite3_reset(upd);
+    }
+    sqlite3_finalize(sel);
+    sqlite3_finalize(upd);
+    CHECK(inlined > 0);
+    lip =sqlite3_serialize(db, "main", &lip_size, 0);
+    CHECK(lip != NULL && memcmp(lip, "SQLite format 3", 16) == 0);
+    if (!lip) goto done;
+
+    CHECK(clip_document_open_memory(&cd, lip, (size_t)lip_size, &err));
+    sqlite3_free(lip);
+    if (!cd) {
+        printf("  %s\n", err.message);
+        goto done;
+    }
+    CHECK(clip_document_container(cd)->bare_sqlite);
+    CHECK(clip_document_canvas(cd)->unit == 2);
+    CHECK(clip_document_canvas(cd)->width == w && clip_document_canvas(cd)->height == h);
+    for (i = 0; i < clip_document_layer_count(cd); ++i) {
+        const clip_layer_info *l = clip_document_layer(cd, i);
+        if (strcmp(l->name, "Ink") != 0) continue;
+        CHECK(clip_document_render_layer(cd, l, &out, &err));
+        CHECK(out.width == w && out.height == h);
+        if (out.pixels) {
+            CHECK(memcmp(at(&out, 3, 4), at(&ink, 3, 4), 4) == 0);
+            CHECK(memcmp(at(&out, w - 1, h - 1), at(&ink, w - 1, h - 1), 4) == 0);
+        }
+    }
+    CHECK(out.pixels != NULL);
+    clip_document_close(cd);
+done:
+    if (db) sqlite3_close(db);
+    clip_container_free(&c);
+    clip_buffer_free(&file);
+    clip_image_free(&ink);
+    clip_image_free(&out);
+}
+
 static void test_reference_document(void) {
     clip_document *cd = NULL;
     clip_error err;
@@ -466,6 +567,7 @@ int main(int argc, char **argv) {
         {"offscreen_encode_decode", test_offscreen_encode_decode},
         {"write_then_read", test_write_then_read},
         {"layer_effects", test_layer_effects},
+        {"legacy_lip", test_legacy_lip},
         {"reference_document", test_reference_document},
     };
     size_t i;

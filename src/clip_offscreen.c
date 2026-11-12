@@ -20,6 +20,10 @@ static const uint32_t kPackingRgba[16] = {33, 1, 4, 5, 65536, 4, 1024, 1, 256, 6
 /* ... and for the mipmaps of a layer whose expression color is Gray ("channel
  * order 17": alpha plane + one gray plane).  Observed on 2 769 offscreens. */
 static const uint32_t kPackingGray[16] = {17, 1, 1, 2, 65536, 1, 256, 1, 256, 65536, 256, 256, 8, 8, 0, 0};
+/* ... and for layer masks: one 8-bit plane (1 = shown).  Observed on 766 of
+ * the 1 277 mask offscreens in 639 CSP files (the rest differ in fields
+ * that only matter to CSP's own mipmap cache). */
+static const uint32_t kPackingMask[16] = {1, 1, 0, 1, 0, 0, 0, 1, 256, 0, 256, 256, 8, 8, 0, 0};
 
 const char *clip_packing_name(size_t i) {
     static const char *names[16] = {"BlockDataChannelOrder",          "BlockDataChannelBytes",
@@ -40,6 +44,7 @@ const char *clip_pixel_layout_name(clip_pixel_layout l) {
         case CLIP_LAYOUT_BGRX_ALPHA: return "alpha plane + BGRx plane";
         case CLIP_LAYOUT_BGRA: return "interleaved BGRA";
         case CLIP_LAYOUT_CMYK_ALPHA: return "alpha plane + CMYK plane";
+        case CLIP_LAYOUT_MONO_1BIT: return "1-bit monochrome";
         default: return "unknown";
     }
 }
@@ -285,6 +290,24 @@ int clip_offscreen_data_parse(const uint8_t *data, size_t size, clip_offscreen_d
     return 1;
 }
 
+/* 32-bit colour channel: a 16-bit value repeated twice (0xFFFFFFFF is 255). */
+static uint8_t init_channel(uint32_t v) { return (uint8_t)(((v >> 16) * 255u + 32767u) / 65535u); }
+
+int clip_offscreen_init_color(const clip_offscreen_attribute *attr, uint8_t rgba[4]) {
+    memset(rgba, 0, 4);
+    if (!attr->init_do_initialize) return 0;
+    rgba[3] = init_channel(attr->init_alpha_value);
+    if (attr->init_image_value_count >= 3) {
+        size_t k;
+        /* Stored B, G, R like the BGRx tile planes. */
+        for (k = 0; k < 3; ++k) rgba[2 - k] = init_channel(attr->init_image_values[k]);
+    } else {
+        /* Alpha-only offscreens (masks): decoded like CLIP_LAYOUT_ALPHA_ONLY. */
+        rgba[0] = rgba[1] = rgba[2] = rgba[3];
+    }
+    return 1;
+}
+
 int clip_offscreen_decode(const clip_offscreen_attribute *attr, const clip_offscreen_data *data, clip_image *out,
                           clip_pixel_layout *layout_used, clip_error *err) {
     clip_pixel_layout layout = CLIP_LAYOUT_UNKNOWN;
@@ -294,6 +317,15 @@ int clip_offscreen_decode(const clip_offscreen_attribute *attr, const clip_offsc
     size_t bi;
     clip_image_free(out);
     if (!clip_image_init(out, (int)attr->width, (int)attr->height)) return clip__fail(err, "out of memory");
+    {
+        /* Blocks without data hold the InitColor: transparent for ordinary
+         * layers, the fill colour of Fill layers, "visible" for most masks. */
+        uint8_t fill[4];
+        if (clip_offscreen_init_color(attr, fill) && (fill[0] | fill[1] | fill[2] | fill[3])) {
+            size_t i, n = (size_t)out->width * out->height;
+            for (i = 0; i < n; ++i) memcpy(out->pixels + i * 4, fill, 4);
+        }
+    }
     for (bi = 0; bi < data->block_count; ++bi) {
         const clip_offscreen_block *b = &data->blocks[bi];
         clip_pixel_layout l;
@@ -312,6 +344,7 @@ int clip_offscreen_decode(const clip_offscreen_attribute *attr, const clip_offsc
         else if (tile.size == px * 4) l = CLIP_LAYOUT_BGRA;
         else if (tile.size == px * 2) l = CLIP_LAYOUT_GRAY_ALPHA;
         else if (tile.size == px) l = CLIP_LAYOUT_ALPHA_ONLY;
+        else if (tile.size == px / 8) l = CLIP_LAYOUT_MONO_1BIT;
         else {
             clip__fail(err, "block %u inflates to unexpected size %llu", b->index, (unsigned long long)tile.size);
             goto fail;
@@ -349,6 +382,15 @@ int clip_offscreen_decode(const clip_offscreen_attribute *attr, const clip_offsc
                         o[3] = t[i];
                         break;
                     case CLIP_LAYOUT_ALPHA_ONLY: o[0] = o[1] = o[2] = o[3] = t[i]; break;
+                    case CLIP_LAYOUT_MONO_1BIT: {
+                        /* Monochrome layers: 1 bit per pixel, MSB first, set = ink.
+                         * Ink is black; the "white" colour is drawn by a second
+                         * plane that CSP 1.x does not store for these layers. */
+                        uint8_t on = (uint8_t)((t[i >> 3] >> (7 - (i & 7))) & 1);
+                        o[0] = o[1] = o[2] = 0;
+                        o[3] = on ? 255 : 0;
+                        break;
+                    }
                     default: break;
                 }
             }
@@ -368,14 +410,18 @@ fail:
 static int write_attribute(uint32_t w, uint32_t h, uint32_t bcx, uint32_t bcy, const uint32_t *block_sizes, size_t nblocks,
                            int paper_fill, int gray, clip_buffer *attribute) {
     clip_buffer param = {0}, init = {0}, bs = {0}, attr = {0};
-    const uint32_t *packing = gray ? kPackingGray : kPackingRgba;
+    /* `gray`: 0 RGBA, 1 gray + alpha, 2 layer mask. */
+    const uint32_t *packing = gray == 2 ? kPackingMask : gray ? kPackingGray : kPackingRgba;
+    const int mask = gray == 2;
     size_t i;
     int ok = clip__buf_ustr(&param, "Parameter") && clip__buf_u32be(&param, w) && clip__buf_u32be(&param, h) &&
              clip__buf_u32be(&param, bcx) && clip__buf_u32be(&param, bcy);
     for (i = 0; ok && i < 16; ++i) ok = clip__buf_u32be(&param, packing[i]);
+    /* Masks initialise to "shown" (as 281 CSP mask offscreens do), so blocks
+     * that show everything need not be stored. */
     ok = ok && clip__buf_ustr(&init, "InitColor") && clip__buf_u32be(&init, 20) &&
-         clip__buf_u32be(&init, paper_fill ? 1 : 0) &&            /* DoInitialize */
-         clip__buf_u32be(&init, paper_fill ? 0xFFFFFFFFu : 0) &&  /* AlphaValue */
+         clip__buf_u32be(&init, paper_fill || mask ? 1 : 0) &&            /* DoInitialize */
+         clip__buf_u32be(&init, paper_fill || mask ? 0xFFFFFFFFu : 0) &&  /* AlphaValue */
          clip__buf_u32be(&init, paper_fill ? 4 : 0) &&            /* ImageValueCount */
          clip__buf_u32be(&init, 4);
     for (i = 0; ok && paper_fill && i < 4; ++i) ok = clip__buf_u32be(&init, 0);
@@ -399,7 +445,7 @@ int clip__offscreen_encode_ex(const clip_image *img, uint32_t w, uint32_t h, int
     const int store_data = img != NULL;
     const uint32_t bcx = (w + K_BLOCK - 1) / K_BLOCK, bcy = (h + K_BLOCK - 1) / K_BLOCK;
     const size_t px = (size_t)K_BLOCK * K_BLOCK, nblocks = (size_t)bcx * bcy;
-    const size_t tile_bytes = px * (gray ? 2 : 5);
+    const size_t tile_bytes = px * (gray == 2 ? 1 : gray ? 2 : 5);
     uint8_t *tile = NULL;
     uint32_t *block_sizes = NULL, *checksums = NULL;
     clip_buffer bd = {0}, blk = {0}, z = {0};
@@ -416,7 +462,22 @@ int clip__offscreen_encode_ex(const clip_image *img, uint32_t w, uint32_t h, int
         for (bx = 0; ok && bx < bcx; ++bx) {
             uint32_t index = by * bcx + bx, x, y, size;
             int any = 0;
-            if (store_data && gray) {
+            if (store_data && gray == 2) {
+                /* Mask: the mask value from the alpha channel, 255 (shown) outside the image. */
+                memset(tile, 255, px);
+                for (y = 0; y < K_BLOCK; ++y) {
+                    int cy = (int)(by * K_BLOCK + y);
+                    const uint8_t *src;
+                    if (cy >= img->height) break;
+                    src = img->pixels + (size_t)cy * img->width * 4;
+                    for (x = 0; x < K_BLOCK; ++x) {
+                        int cx = (int)(bx * K_BLOCK + x);
+                        if (cx >= img->width) break;
+                        tile[(size_t)y * K_BLOCK + x] = src[(size_t)cx * 4 + 3];
+                        any = any || src[(size_t)cx * 4 + 3] != 255;
+                    }
+                }
+            } else if (store_data && gray) {
                 /* Alpha plane + gray plane.  CSP stores gray 0 under transparent
                  * pixels and Rec. 601 luma elsewhere. */
                 memset(tile, 0, px * 2);

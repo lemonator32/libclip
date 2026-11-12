@@ -83,6 +83,7 @@ typedef struct writer {
     uint64_t next_offset; /* file offset of the next Exta chunk */
     int64_t canvas_id;
     int64_t next_layer, next_mipmap, next_mipmap_info, next_offscreen, next_thumb;
+    int64_t next_extra; /* ids for a layer's second mipmap/thumbnail (its mask), above all layer ids */
     uint64_t seed;
     int canvas_w, canvas_h;
 } writer;
@@ -192,15 +193,17 @@ static int64_t add_offscreen(writer *w, int64_t layer_id, const clip_buffer *att
 }
 
 /* Five-level mipmap chain (100, 50, 25, 12.5, 6.25 %).  Only the base level
- * carries pixels; CSP regenerates the rest.  Returns Mipmap.MainId. */
-static int64_t add_mipmap(writer *w, int64_t layer_id, const clip_image *pixels, uint32_t width, uint32_t height, int paper_fill,
-                          int gray) {
-    /* CSP gives a layer's Mipmap row the layer's own MainId (observed). */
-    int64_t mipmap_id = layer_id, info_ids[5];
+ * carries pixels; CSP regenerates the rest.  `layout`: 0 RGBA, 1 gray, 2 mask.
+ * Returns Mipmap.MainId (`id`). */
+static int64_t add_mipmap(writer *w, int64_t id, int64_t layer_id, const clip_image *pixels, uint32_t width, uint32_t height,
+                          int paper_fill, int layout) {
+    /* CSP usually gives a layer's render Mipmap row the layer's own MainId;
+     * a mask's chain gets an id of its own. */
+    int64_t mipmap_id = id, info_ids[5];
     double scale = 100.0;
     int level;
     row r;
-    if (w->next_mipmap < layer_id + 1) w->next_mipmap = layer_id + 1;
+    if (w->next_mipmap < id + 1) w->next_mipmap = id + 1;
     for (level = 0; level < 5; ++level) info_ids[level] = w->next_mipmap_info++;
     for (level = 0; level < 5; ++level) {
         uint32_t lw = width >> level, lh = height >> level;
@@ -210,9 +213,9 @@ static int64_t add_mipmap(writer *w, int64_t layer_id, const clip_image *pixels,
         int64_t off;
         if (lw < 1) lw = 1;
         if (lh < 1) lh = 1;
-        /* A Gray layer stores every level as alpha + gray (observed). */
+        /* A Gray layer stores every level as alpha + gray (observed); a mask as one plane. */
         ok = clip__offscreen_encode_ex(store ? pixels : NULL, store ? (uint32_t)pixels->width : lw, store ? (uint32_t)pixels->height : lh,
-                                       paper_fill, gray, &attr, &blocks, &e);
+                                       paper_fill, layout, &attr, &blocks, &e);
         if (!ok) {
             set_err(w, e.message);
             return 0;
@@ -240,24 +243,24 @@ static int64_t add_mipmap(writer *w, int64_t layer_id, const clip_image *pixels,
     return mipmap_id;
 }
 
-static int64_t color_value(int paper, uint8_t c) { return paper ? (c == 255 ? K_WHITE : c) : 0; }
+static int64_t color_value(int paper, uint8_t c) { return paper ? (int64_t)((uint32_t)c * 0x01010101u) : 0; }
 
-static int64_t add_thumbnail(writer *w, int64_t layer_id, const clip_image *pixels, int paper, const uint8_t *paper_rgb) {
+static int64_t add_thumbnail(writer *w, int64_t id, int64_t layer_id, const clip_image *pixels, int paper, const uint8_t *paper_rgb) {
     static const char *refresh[] = {"ThumbnailSmallerNeedRefresh",   "ThumbnailSmallNeedRefresh",    "ThumbnailMiddleNeedRefresh",
                                     "ThumbnailLargeNeedRefresh",     "ThumbnailLargerNeedRefresh",   "ThumbnailMiddle2xNeedRefresh",
                                     "ThumbnailLarger2xNeedRefresh",  "ThumbnailSmallerNeedRefresh1", "ThumbnailSmallNeedRefresh1",
                                     "ThumbnailMiddleNeedRefresh1",   "ThumbnailLargeNeedRefresh1",   "ThumbnailLargerNeedRefresh1",
                                     "ThumbnailMiddle2xNeedRefresh1", "ThumbnailLarger2xNeedRefresh1"};
     static const uint8_t black[3] = {0, 0, 0};
-    /* Same ownership rule as Mipmap: LayerThumbnail.MainId == LayerId. */
-    int64_t id = layer_id, off;
+    /* Same ownership rule as Mipmap: usually LayerThumbnail.MainId == LayerId. */
+    int64_t off;
     clip_buffer attr = {0}, blocks = {0};
     clip_error e;
     row r;
     size_t i;
     int ok;
     if (!paper_rgb) paper_rgb = black;
-    if (w->next_thumb < layer_id + 1) w->next_thumb = layer_id + 1;
+    if (w->next_thumb < id + 1) w->next_thumb = id + 1;
     if (pixels) {
         clip_image small = {0, 0, NULL};
         ok = clip__image_downscale(pixels, 512, 512, &small) && clip_offscreen_encode(&small, &attr, &blocks, &e);
@@ -366,6 +369,23 @@ static void layer_common(writer *w, row *r, const layer_fields *f, char uuid[37]
     put(r, ci("LayerLayerMaskMipmap", 0));
     put(r, ci("LayerRenderThumbnail", f->thumb));
     put(r, ci("LayerLayerMaskThumbnail", 0));
+}
+
+/* Replaces the value of an integer column already in the row. */
+static void set_col(row *r, const char *name, int64_t v) {
+    int k;
+    for (k = 0; k < r->n; ++k)
+        if (strcmp(r->c[k].name, name) == 0) r->c[k].i = v;
+}
+
+/* The mask as a canvas offscreen padded to whole blocks: outside the image it shows. */
+static int padded_mask(const clip_image *mask, uint32_t pw, uint32_t ph, clip_image *out) {
+    size_t i, n;
+    if (!clip_image_init(out, (int)pw, (int)ph)) return 0;
+    n = (size_t)pw * ph;
+    for (i = 0; i < n; ++i) out->pixels[i * 4 + 3] = 255;
+    clip__image_blit(out, mask, 0, 0);
+    return 1;
 }
 
 /* MonochromeFillInfo blob of the Paper layer, as observed. */
@@ -527,6 +547,7 @@ static int build(writer *w, const clip_write_document *doc) {
     const size_t n = doc->layer_count;
     const uint32_t pad_w = ((uint32_t)doc->width + 255) / 256 * 256, pad_h = ((uint32_t)doc->height + 255) / 256 * 256;
     int64_t *ids = (int64_t *)clip__malloc(sizeof(int64_t) * (n ? n : 1));
+    int64_t *next = NULL, *child = NULL, top_first = 0;
     int64_t current_layer;
     char uuid[37];
     uint8_t effect_blob[sizeof kEffectInfoTemplate];
@@ -538,6 +559,34 @@ static int build(writer *w, const clip_write_document *doc) {
         return 0;
     }
     for (i = 0; i < n; ++i) ids[i] = w->next_layer++;
+    /* Tree links.  next[i]: the sibling above layer i (0 at the top of its
+     * folder); child[i]: a folder's bottom-most child; top_first: the
+     * bottom-most top-level layer. */
+    next = (int64_t *)clip__calloc(n ? n : 1, sizeof(int64_t));
+    child = (int64_t *)clip__calloc(n ? n : 1, sizeof(int64_t));
+    if (!next || !child) {
+        free(ids);
+        free(next);
+        free(child);
+        set_err(w, "out of memory");
+        return 0;
+    }
+    for (i = 0; i < n; ++i) {
+        size_t j;
+        for (j = i + 1; j < n && doc->layers[j].depth > doc->layers[i].depth; ++j) {}
+        if (j < n && doc->layers[j].depth == doc->layers[i].depth) next[i] = ids[j];
+        if (doc->layers[i].kind == CLIP_WRITE_FOLDER) {
+            /* Its contents are the run below it deeper than it; the first child is the lowest of them at depth + 1. */
+            size_t k = i;
+            while (k > 0 && doc->layers[k - 1].depth > doc->layers[i].depth) --k;
+            for (; k < i; ++k)
+                if (doc->layers[k].depth == doc->layers[i].depth + 1) {
+                    child[i] = ids[k];
+                    break;
+                }
+        }
+        if (!top_first && doc->layers[i].depth == 0) top_first = ids[i];
+    }
 
     write_schema(w);
     /* CSP adds the effect columns to Layer only once a layer uses an effect
@@ -549,6 +598,21 @@ static int build(writer *w, const clip_write_document *doc) {
             break;
         }
 
+    /* Correction and gradient layers carry their settings in columns CSP adds
+     * to Layer on first use (as BLOB, like LayerEffectInfo). */
+    for (i = 0; i < n; ++i)
+        if (doc->layers[i].kind == CLIP_WRITE_FILTER) {
+            exec_sql(w, "ALTER TABLE Layer ADD COLUMN FilterLayerInfo BLOB DEFAULT NULL");
+            break;
+        }
+    for (i = 0; i < n; ++i)
+        if (doc->layers[i].kind == CLIP_WRITE_GRADIENT) {
+            exec_sql(w, "ALTER TABLE Layer ADD COLUMN GradationFillInfo BLOB DEFAULT NULL");
+            break;
+        }
+    /* Mask mipmaps and thumbnails take ids above every layer's. */
+    w->next_extra = w->next_layer;
+
     /* ---- layers ----
      * Bottom-up order in the file: the root's first child is the bottom-most
      * layer (the Paper, when present) and NextIndex walks upwards. */
@@ -557,7 +621,8 @@ static int build(writer *w, const clip_write_document *doc) {
         clip_image tmp = {0, 0, NULL}, padded = {0, 0, NULL};
         const clip_image *px = NULL;
         layer_fields f;
-        int64_t mip, thumb;
+        int64_t mip, thumb, mask_mip, mask_thumb;
+        const int masked = l->mask.pixels != NULL;
         /* Layer offscreens are padded to whole blocks, as CSP does. */
         if (!canvas_image(&l->pixels, doc->width, doc->height, &tmp, &px) || !clip_image_init(&padded, (int)pad_w, (int)pad_h)) {
             clip_image_free(&tmp);
@@ -565,23 +630,88 @@ static int build(writer *w, const clip_write_document *doc) {
             break;
         }
         clip__image_blit(&padded, px, 0, 0);
-        mip = add_mipmap(w, ids[i], &padded, pad_w, pad_h, 0, l->effects.expression_color == CLIP_EXPRESSION_GRAY);
-        thumb = add_thumbnail(w, ids[i], px, 0, NULL);
+        mip = add_mipmap(w, ids[i], ids[i], l->kind == CLIP_WRITE_FOLDER ? NULL : &padded, pad_w, pad_h, 0,
+                         l->kind == CLIP_WRITE_RASTER && l->effects.expression_color == CLIP_EXPRESSION_GRAY);
+        thumb = add_thumbnail(w, ids[i], ids[i], l->kind == CLIP_WRITE_FOLDER ? NULL : px, 0, NULL);
         clip_image_free(&padded);
         clip_image_free(&tmp);
+        mask_mip = mask_thumb = 0;
+        if (l->mask.pixels && !w->err[0]) {
+            clip_image pm = {0, 0, NULL};
+            if (!padded_mask(&l->mask, pad_w, pad_h, &pm)) {
+                set_err(w, "out of memory");
+                break;
+            }
+            mask_mip = add_mipmap(w, w->next_extra++, ids[i], &pm, pad_w, pad_h, 0, 2);
+            mask_thumb = add_thumbnail(w, w->next_extra++, ids[i], NULL, 0, NULL);
+            clip_image_free(&pm);
+        }
         memset(&f, 0, sizeof f);
         f.id = ids[i];
         f.name = l->name ? l->name : "";
-        f.type = 1;
+        f.type = (l->kind == CLIP_WRITE_FILTER ? 0x1000
+                  : l->kind == CLIP_WRITE_GRADIENT || l->kind == CLIP_WRITE_FOLDER ? 0
+                                                                                   : CLIP_LAYER_TYPE_RASTER) |
+                 (masked ? 2 : 0);
         f.visible = l->visible;
         f.locked = l->locked;
         f.clip = l->clip;
         f.opacity256 = l->opacity;
         f.composite = l->composite;
-        f.next = i + 1 < n ? ids[i + 1] : 0;
+        f.next = next[i];
+        f.first_child = child[i];
+        f.folder = l->kind == CLIP_WRITE_FOLDER;
         f.mipmap = mip;
         f.thumb = thumb;
         layer_common(w, &r, &f, uuid);
+        if (masked) {
+            /* LayerMasking bit 0 enables the mask; LayerVisibility bit 1 is set on
+             * masked layers (315 of 335 masked raster layers). */
+            set_col(&r, "LayerMasking", (l->kind == CLIP_WRITE_FILTER || l->kind == CLIP_WRITE_FOLDER ? 32 : 0) | (l->mask_enabled ? 1 : 0));
+            set_col(&r, "LayerVisibility", (l->visible ? 1 : 0) | 2);
+            set_col(&r, "LayerLayerMaskMipmap", mask_mip);
+            set_col(&r, "LayerLayerMaskThumbnail", mask_thumb);
+        } else if (l->kind == CLIP_WRITE_FILTER) {
+            set_col(&r, "LayerMasking", 32);
+        }
+        if (l->kind == CLIP_WRITE_FOLDER) {
+            /* LayerFolder 17 (924 folders) is an open folder, 1 (999) a closed one. */
+            set_col(&r, "LayerFolder", l->expanded ? 17 : 1);
+            set_col(&r, "LayerSelect", i == doc->active_layer ? 1 : 0);
+            insert(w, "Layer", &r);
+            continue;
+        }
+        if (l->kind == CLIP_WRITE_FILTER) {
+            /* As on all 116 surveyed correction layers. */
+            put(&r, ci("SpecialRenderType", 13));
+            put(&r, ci("SetRenderThumbnailInfoType", 20));
+            put(&r, ci("DrawRenderThumbnailType", 20));
+            put(&r, cb("FilterLayerInfo", l->filter_info, l->filter_info_size));
+            if (clip__rd_u32be(l->filter_info) == CLIP_FILTER_GRADIENT_MAP) put(&r, ci("FilterLayerV132", 1));
+            set_col(&r, "LayerSelect", i == doc->active_layer ? 1 : 0);
+            insert(w, "Layer", &r);
+            continue;
+        }
+        if (l->kind == CLIP_WRITE_GRADIENT) {
+            /* As on all 380 surveyed gradient / fill layers. */
+            clip_buffer gi = {0};
+            if (!clip_gradation_encode(l->gradient, &gi)) {
+                set_err(w, "cannot encode gradient");
+                break;
+            }
+            put(&r, ci("DrawToRenderOffscreenType", 60));
+            put(&r, ci("DrawToRenderMipmapType", 32));
+            put(&r, ci("MoveOffsetAndExpandType", 30));
+            put(&r, ci("FixOffsetAndExpandType", 30));
+            put(&r, ci("RenderBoundForLayerMoveType", 30));
+            put(&r, ci("SetRenderThumbnailInfoType", 30));
+            put(&r, ci("DrawRenderThumbnailType", 30));
+            put(&r, cb("GradationFillInfo", gi.data, gi.size));
+            set_col(&r, "LayerSelect", i == doc->active_layer ? 1 : 0);
+            insert(w, "Layer", &r);
+            clip_buffer_free(&gi);
+            continue;
+        }
         {
             const clip_layer_effects *fx = &l->effects;
             int k;
@@ -611,21 +741,22 @@ static int build(writer *w, const clip_write_document *doc) {
         int white = pc[0] == 255 && pc[1] == 255 && pc[2] == 255;
         clip_buffer mono = {0};
         layer_fields f;
-        int64_t mip = add_mipmap(w, paper_id, NULL, (uint32_t)doc->width, (uint32_t)doc->height, 1, 0);
-        int64_t thumb = add_thumbnail(w, paper_id, NULL, 1, pc);
+        int64_t mip = add_mipmap(w, paper_id, paper_id, NULL, (uint32_t)doc->width, (uint32_t)doc->height, 1, 0);
+        int64_t thumb = add_thumbnail(w, paper_id, paper_id, NULL, 1, pc);
         memset(&f, 0, sizeof f);
         f.id = paper_id;
         f.name = "Paper";
         f.type = CLIP_LAYER_TYPE_PAPER;
         f.visible = 1;
         f.opacity256 = 256;
-        f.next = n ? ids[0] : 0;
+        f.next = top_first;
         f.mipmap = mip;
         f.thumb = thumb;
         layer_common(w, &r, &f, uuid);
-        put(&r, ci("DrawColorMainRed", white ? K_WHITE : pc[0]));
-        put(&r, ci("DrawColorMainGreen", white ? K_WHITE : pc[1]));
-        put(&r, ci("DrawColorMainBlue", white ? K_WHITE : pc[2]));
+        /* 32-bit channels as CSP writes them (see chan_value in clip_document.c). */
+        put(&r, ci("DrawColorMainRed", white ? K_WHITE : (int64_t)rep8(pc[0])));
+        put(&r, ci("DrawColorMainGreen", white ? K_WHITE : (int64_t)rep8(pc[1])));
+        put(&r, ci("DrawColorMainBlue", white ? K_WHITE : (int64_t)rep8(pc[2])));
         put(&r, ci("DrawColorEnable", 1));
         put(&r, ci("DrawToRenderOffscreenType", 61));
         put(&r, ci("SpecialRenderType", 20));
@@ -642,8 +773,8 @@ static int build(writer *w, const clip_write_document *doc) {
     }
     if (!w->err[0]) {
         layer_fields f;
-        int64_t mip = add_mipmap(w, root_id, NULL, (uint32_t)doc->width, (uint32_t)doc->height, 0, 0);
-        int64_t thumb = add_thumbnail(w, root_id, NULL, 0, NULL);
+        int64_t mip = add_mipmap(w, root_id, root_id, NULL, (uint32_t)doc->width, (uint32_t)doc->height, 0, 0);
+        int64_t thumb = add_thumbnail(w, root_id, root_id, NULL, 0, NULL);
         memset(&f, 0, sizeof f);
         f.id = root_id;
         f.name = "";
@@ -651,7 +782,7 @@ static int build(writer *w, const clip_write_document *doc) {
         f.folder = 1;
         f.visible = 1;
         f.opacity256 = 256;
-        f.first_child = paper_id ? paper_id : (n ? ids[0] : 0);
+        f.first_child = paper_id ? paper_id : top_first;
         f.mipmap = mip;
         f.thumb = thumb;
         layer_common(w, &r, &f, uuid);
@@ -661,6 +792,8 @@ static int build(writer *w, const clip_write_document *doc) {
     /* ---- canvas / project / banks ---- */
     current_layer = n ? ids[doc->active_layer < n ? doc->active_layer : n - 1] : (paper_id ? paper_id : root_id);
     free(ids);
+    free(next);
+    free(child);
     if (w->err[0]) return 0;
 
     r.n = 0;
@@ -817,6 +950,26 @@ int clip_write_memory(const clip_write_document *doc, clip_buffer *out, clip_err
             return clip__fail(err, "layer %u: only Color and Gray expression colors can be written", (unsigned)i);
         if (fx->border && !(fx->border_width > 0.0 && fx->border_width <= 1000.0))
             return clip__fail(err, "layer %u: border width out of range", (unsigned)i);
+        {
+            const clip_write_layer *l = &doc->layers[i];
+            if (l->kind == CLIP_WRITE_FILTER && (!l->filter_info || l->filter_info_size < 8 ||
+                                                 8 + (size_t)clip__rd_u32be(l->filter_info + 4) > l->filter_info_size))
+                return clip__fail(err, "layer %u: correction layer without valid FilterLayerInfo", (unsigned)i);
+            if (l->kind == CLIP_WRITE_GRADIENT && (!l->gradient || l->gradient->stop_count == 0 ||
+                                                   l->gradient->stop_count > CLIP_GRADIENT_MAX_STOPS))
+                return clip__fail(err, "layer %u: gradient layer without stops", (unsigned)i);
+            if (l->kind < CLIP_WRITE_RASTER) return clip__fail(err, "layer %u: unknown layer kind %d", (unsigned)i, (int)l->kind);
+            if (l->kind > CLIP_WRITE_FOLDER) return clip__fail(err, "layer %u: unknown layer kind %d", (unsigned)i, (int)l->kind);
+            /* Nesting: a layer deeper than the one above it must be closed by a
+             * folder exactly one level up; the top layer is not in a folder. */
+            if (l->depth < 0 || (i + 1 == doc->layer_count && l->depth != 0))
+                return clip__fail(err, "layer %u: bad folder depth %d", (unsigned)i, l->depth);
+            if (i + 1 < doc->layer_count && doc->layers[i + 1].depth < l->depth &&
+                (doc->layers[i + 1].kind != CLIP_WRITE_FOLDER || doc->layers[i + 1].depth != l->depth - 1))
+                return clip__fail(err, "layer %u: not closed by its folder", (unsigned)i);
+            if (l->mask.pixels && (l->mask.width != doc->width || l->mask.height != doc->height))
+                return clip__fail(err, "layer %u: the mask must be canvas-sized", (unsigned)i);
+        }
     }
 
     memset(&w, 0, sizeof w);

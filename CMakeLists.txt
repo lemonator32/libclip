@@ -34,6 +34,7 @@ add_library(clip
   src/clip_container.c
   src/clip_offscreen.c
   src/clip_document.c
+  src/clip_gradient.c
   src/clip_writer.c)
 add_library(libclip::clip ALIAS clip)
 target_include_directories(clip PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include> PRIVATE src)
@@ -54,7 +55,8 @@ endif()
 if(LIBCLIP_BUILD_TESTS)
   enable_testing()
   add_executable(libclip_tests tests/test_libclip.c)
-  target_link_libraries(libclip_tests PRIVATE libclip::clip)
+  # SQLite is linked directly so the tests can build legacy .lip images.
+  target_link_libraries(libclip_tests PRIVATE libclip::clip libclip_sqlite3)
   set_target_properties(libclip_tests PROPERTIES C_STANDARD 99)
   if(MSVC)
     target_compile_definitions(libclip_tests PRIVATE _CRT_SECURE_NO_WARNINGS)
