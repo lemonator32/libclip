@@ -20,9 +20,9 @@ worked out from files and documented in [`docs/FORMAT.md`](docs/FORMAT.md).
 
 | | |
 |---|---|
-| **Read** | Canvas size, resolution and colour depth; the layer tree (folders, nesting, palette order); name, visibility, lock, opacity, blend mode, clipping and offsets of each layer; raster layer pixels and layer masks; the embedded preview image; the Paper layer colour; read-only SQL over the embedded database for anything else |
-| **Write** | 8-bit RGBA raster layers with name, visibility, lock, clipping, opacity and blend mode; an optional Paper layer; canvas size and DPI; the embedded preview image |
-| **Not supported** | Vector, text, gradient, tone, adjustment and 3D layers (they read as plain layer records without pixels); 16-bit and CMYK documents; animation and multi-page projects (`.cmc`); writing folders or masks |
+| **Read** | Canvas size, resolution and colour depth; the layer tree (folders, nesting, palette order); name, visibility, lock, opacity, blend mode, clipping and offsets of each layer; raster layer pixels (Color, Gray and 1-bit Monochrome expression colours) and layer masks; Layer Property effects (border, layer colour); the settings of gradient, fill and correction (filter) layers; the embedded preview image; the Paper layer colour; read-only SQL over the embedded database for anything else |
+| **Write** | 8-bit RGBA raster layers (Color or Gray) with name, visibility, lock, clipping, opacity, blend mode and layer effects; folders (open or closed, optionally pass-through); layer masks; correction layers from a `FilterLayerInfo` blob; linear gradient and fill layers; an optional Paper layer; canvas size and DPI; the embedded preview image |
+| **Not supported** | Vector, text, tone and 3D layers (they read as plain layer records; their rendered pixels are available when CSP stored them); 16-bit and CMYK documents; animation and multi-page projects (`.cmc`); writing Monochrome layers or non-linear gradient shapes |
 | **Compositing** | libclip returns each layer separately with its blend mode and opacity. Flattening the layers is left to the application. |
 
 The format details behind this, including the rules Clip Studio Paint
@@ -138,9 +138,19 @@ int dump(const char *path) {
   each folder followed by its contents. `depth` gives the nesting level.
 * `composite` holds the blend mode as a `clip_composite` value. `opacity`
   runs from 0 to 256, where 256 is 100 %.
-* `clip_document_render_layer_mask()` returns a layer's mask, and
-  `clip_document_canvas_preview()` the flattened preview Clip Studio Paint
-  stored in the file.
+* `clip_document_render_layer_mask()` returns a layer's mask (check
+  `clip_layer_mask_enabled()` first: a disabled mask is stored but not
+  applied), and `clip_document_canvas_preview()` the flattened preview Clip
+  Studio Paint stored in the file.
+* `effects` holds the Layer Property settings: border effect, layer colour
+  and expression colour (`clip_expression_color`).
+* Correction layers (`clip_layer_is_filter()`) carry their parameters in
+  `filter_info`, a `FilterLayerInfo` blob whose kinds are the `CLIP_FILTER_*`
+  constants. Gradient and fill layers carry `gradation_info`; decode it with
+  `clip_gradation_parse()`, which gives the colour stops, the shape and
+  repeat mode, the start and end points, or the single fill colour. Both
+  blobs are described in [`docs/FORMAT.md`](docs/FORMAT.md) §4.4.2.
+  libclip does not render these layers; the application does.
 * `clip_document_open_memory()` reads from a buffer instead of a file.
 * For anything the structs don't cover, `clip_document_query()` runs
   read-only SQL against the embedded database. The table and column names
@@ -182,8 +192,20 @@ int save(const clip_image *ink, const clip_image *flattened, const char *path) {
 
 * Layers are given **bottom to top** (the reverse of what the reader
   returns).
+* `kind` chooses what a layer is: `CLIP_WRITE_RASTER` (the default),
+  `CLIP_WRITE_FOLDER`, `CLIP_WRITE_FILTER` (a correction layer; set
+  `filter_info` to a `FilterLayerInfo` blob) or `CLIP_WRITE_GRADIENT` (set
+  `gradient` to a `clip_gradient`; a linear gradient or, with `fill` set, a
+  single-colour fill layer). A folder sits directly above its contents in
+  the list, which have a greater `depth`; composite `CLIP_COMPOSITE_THROUGH`
+  makes it pass-through.
+* `mask` adds a layer mask (canvas-sized, the mask in the alpha channel);
+  `mask_enabled` is whether CSP applies it.
+* `effects` writes the border effect, layer colour and expression colour.
+  A `CLIP_EXPRESSION_GRAY` layer is stored as gray (the luma of `pixels`).
 * libclip doesn't composite, so the preview is the flattened image of your
-  own renderer, or `NULL` for none.
+  own renderer, or `NULL` for none. Correction and gradient layers may be
+  given `pixels` too: CSP shows them until it renders the layer itself.
 * `clip_write_memory()` writes into a `clip_buffer` instead of a file.
 * Output is deterministic: the same input always produces the same bytes.
 
@@ -253,7 +275,8 @@ include/libclip/clip.h   the public API
 src/                     the implementation
   clip_container.c         CSFCHUNK container: parse and build
   clip_offscreen.c         tiled raster: attribute blob, tile stream, encode and decode
-  clip_document.c          reader: database, canvas, layer tree, layer pixels, SQL access
+  clip_document.c          reader: database, canvas, layer tree, layer pixels, masks, effects, SQL access
+  clip_gradient.c          GradationFillInfo (gradient / fill layer settings): parse and encode
   clip_writer.c            writer: clip_write_document -> .clip
   clip_zlib.c              zlib inflate and DEFLATE encoder, CRC-32, Adler-32
   clip_png.c               PNG decode and encode

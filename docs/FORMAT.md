@@ -263,16 +263,22 @@ LayerColorTypeIndex LayerColorTypeBlackChecked LayerColorTypeWhiteChecked
 * In the reference file the root's first child is the Paper layer, and the
   Paper's `NextIndex` is Layer 1.
 
-**`LayerType`** is a bit set **[observed]**:
+**`LayerType`** is a bit set **[observed]** (surveyed over the same
+CSP-saved files as §4.4.1):
 
 | Value | Meaning |
 |---|---|
 | `0x001` (1) | raster image layer |
-| `0x100` (256) | folder (the root folder is exactly 256) |
+| `0x002` | the layer has a layer mask (`LayerLayerMaskMipmap` is set); raster layers with a mask are 3 |
+| `0x100` (256) | folder (the root folder is exactly 256; ordinary folders are 0 or `0x320`, with `LayerFolder` nonzero) |
 | `0x630` (1584) | Paper fill layer |
+| `0x1000` (4096) | correction (filter) layer, `0x1002` with a mask; `FilterLayerInfo` holds its settings (§4.4.2) |
+| `0x000` | folders, and gradient / fill layers (`GradationFillInfo`, §4.4.2); also vector, text and other special layers |
 
-Other kinds (vector, text, gradient, 3-D, tone, adjustment) were not in the
-reference file **[unknown]**.
+Vector, text, tone and 3-D layers are told apart by their own tables and
+columns (`VectorObjectList`, `VectorNormalType`, …), which libclip does not
+model **[unknown]**. Their `LayerRenderMipmap` holds CSP's rendering of the
+layer, so they read as raster pixels.
 
 **Compositing**
 
@@ -282,9 +288,23 @@ reference file **[unknown]**.
   **[inferred, untested]**.
 * `LayerClip`: 1 = clip to the layer below.
 * `LayerVisibility`, `LayerLock`, and `LayerSelect`, which is 1 on the
-  selected layer.
-* `LayerMasking`: 32 on the root folder, 0 on ordinary layers
-  **[unknown meaning]**.
+  selected layer. `LayerVisibility` bit 0 is the layer's eye; bit 1 is set
+  on most masked layers (315 of 335 masked raster layers) **[observed]**.
+* `LayerMasking`: bit 0 (1) means the layer mask is applied; a mask whose
+  layer has bit 0 clear is stored but switched off. Bit 5 (32) is set on the
+  root folder, on correction layers and on folders with masks
+  **[observed, meaning unknown]**.
+
+**Layer masks** **[observed]**
+
+* A layer with `LayerType` bit `0x002` has a mask: `LayerLayerMaskMipmap`
+  points to a mipmap chain like the pixels' (§4.5), `LayerLayerMaskThumbnail`
+  to a thumbnail. The mask tiles are alpha-only (§5.3); 255 shows the layer.
+  The mask is placed at `LayerMaskOffsetX/Y + LayerMaskOffscrOffsetX/Y`, and
+  blocks without data take the offscreen's InitColor (usually "show").
+* Of 857 masked layers surveyed, 368 had the mask enabled and 489 disabled.
+* libclip reads masks on any layer kind and writes them on raster, correction
+  and folder layers **[tested: CSP opens them]**.
 
 **Geometry** **[observed]**
 
@@ -316,6 +336,114 @@ reference file **[unknown]**.
 * `LayerUuid`: 32 lower-case hex digits grouped 10-4-4-4-10. Any such value
   is accepted **[tested]**.
 * `LayerColorType*` appear on raster layers only.
+
+#### 4.4.1 Layer Property effects [observed]
+
+Surveyed over 693 CSP-saved files (10 000+ layer rows).
+
+* **Expression color**: `LayerColorTypeIndex` 0 = Color, 1 = Gray,
+  2 = Monochrome. `LayerColorTypeBlackChecked/WhiteChecked` are the
+  Monochrome "black/white" toggles; libclip writes 1/1. The index also sets
+  the storage of **every mipmap level**: Color uses channel order 33
+  (alpha + BGRx, §5.3), Gray uses channel order 17 with packing
+  `17 1 1 2 65536 1 256 1 256 65536 256 256 8 8 0 0`: a tile inflates to an
+  alpha plane followed by one gray plane (2 bytes/px). Gray is 0 under
+  transparent pixels. Monochrome uses a 1-bit packing (`17 1 1 1 8192 …`)
+  that libclip does not write. The layer thumbnail stays order 33.
+* **Layer color**: `LayerUsePaletteColor` 1 enables it;
+  `LayerPaletteRed/Green/Blue` hold the colour with the 8-bit value repeated
+  in all four bytes (`0x78787878`; white is `0xFFFFFFFF`).
+  `LayerNoticeablePaletteColor` was 0 in every file.
+* **`LayerEffectAttached INTEGER DEFAULT NULL`, `LayerEffectInfo BLOB
+  DEFAULT NULL`** are **not** in the base `Layer` table: CSP appends this
+  pair with `ALTER TABLE` the first time a layer in the document gets an
+  effect (70 of 639 surveyed files). `LayerEffectAttached` is 1 next to a
+  blob (or NULL in older files); both are NULL on layers whose effects were
+  never touched. The `ParamScheme` row for `LayerEffectInfo` is always
+  present.
+* **`LayerEffectInfo`**: Always **610, 602 or 598 bytes**, version 2:
+
+  ```
+  u32 totalSize, u32 2
+  ustr "EffectEdge"          24-byte payload (no size word)
+  ustr "EffectTone"          76 bytes      ┐
+  ustr "EffectTextureMap"    16 bytes      │ each payload starts with its
+  ustr "EffectApplyOpacity"   8 bytes      │ own u32 size (except where
+  ustr "EffectToneAreaColor" 16 bytes      │ noted)
+  ustr "EffectTonePosterize" 28 bytes      │
+  ustr "EffectWaterEdge"     40 bytes      │
+  ustr "EffectLine"          116 bytes + 0/4/12-byte tail (CSP version) ┘
+  ```
+
+  The **border effect** is `EffectEdge`: `u32 enabled`, `f64 width` in
+  pixels (e.g. 3.0, 1.0, 7.09), then `u32 red, green, blue` with the byte
+  repeated in all four bytes. The other sections hold the tone, watercolor
+  edge and line-extraction settings, whose layouts are **[unknown]**.
+  libclip writes the 610-byte blob that CSP most often wrote for a layer
+  with a border, patching only `EffectEdge`, and writes NULL when the border
+  is off. Whether CSP opens such files is **[untested]**.
+
+#### 4.4.2 Correction, gradient and fill layers [observed]
+
+Both kinds are "layers without their own pixels": CSP keeps a rendering in
+`LayerRenderMipmap` (which may be empty right after creation) and
+regenerates it from a settings blob in the `Layer` row. Both columns are
+appended with `ALTER TABLE` when first needed, like `LayerEffectInfo`.
+
+**Correction layers** (`LayerType` `0x1000`): `FilterLayerInfo BLOB`, all
+values big-endian:
+
+```
+u32 kind, u32 parameterSize, parameterSize bytes of parameters
+```
+
+| kind | Correction | Parameters | Surveyed layers |
+|---|---|---|---|
+| 1 | Brightness/Contrast | `i32 brightness, i32 contrast` (-100…100) | 11 |
+| 2 | Level correction | 32 records of 5 `u16`: input black, gamma point, input white, output black, output white (0…65535); record 0 is RGB, 1-3 are R, G, B, the rest unused | 8 |
+| 3 | Tone curve | 32 curves of `u16 count` + 32 × (`u16 in, u16 out`) = 130 bytes each; curve 0 is RGB, 1-3 are R, G, B, the rest straight lines | 13 |
+| 4 | Hue/Saturation/Luminosity | `i32 hue` (degrees), `i32 saturation, i32 luminosity` (-100…100) | 38 |
+| 5 | Color balance | `i32 preserveLuminosity`, then shadows, midtones, highlights as `i32` cyan-red, magenta-green, yellow-blue (-100…100) | 12 |
+| 6 | Reverse gradient | none | 1 |
+| 7 | Posterization | `i32 levels` **[assumed, not seen]** | 0 |
+| 8 | Binarization | `i32 threshold` **[assumed, not seen]** | 0 |
+| 9 | Gradient map | `u32 size`, then a stop table (below) | 33 |
+
+Alongside the blob CSP sets `SpecialRenderType` 13 and
+`SetRenderThumbnailInfoType` and `DrawRenderThumbnailType` 20 (all 116
+surveyed correction layers), and `FilterLayerV132` 1 on gradient maps.
+`LayerMasking` has bit 5 set.
+
+**Gradient and fill layers** (`LayerType` 0): `GradationFillInfo BLOB`.
+`u32 totalSize, u32 version 2`, then named sections (a `ustr` is `u32`
+length in UTF-16 units + UTF-16BE text):
+
+```
+ustr "GradationData"           u32 payloadSize, stop table
+ustr "GradationSetting"        68 bytes, no size word:
+                               u32 shape (0 linear), u32 repeat (0 none),
+                               u32 antiAlias, f64 ellipse scale %, f64 scale %,
+                               f64 angle, f64 startX, startY, endX, endY (canvas px)
+ustr "GradationSettingAdd0001" u32 20, u32 isFill, u32 R, G, B (byte repeated), u32 1
+```
+
+The **stop table** (also the Gradient map's parameters): `u32 16` (header
+size), `u32 28` (stop size), `u32 count`, `u32 16`, then per stop `u32 R, G,
+B, A` as 16-bit values repeated (`0xFFFFFFFF` = 255), `u32 flags` (1 on the
+first stop and 2 on the last of a layer gradient, 0 otherwise), `u32
+position` (0…32768), `u32 0`.
+
+Every surveyed gradient layer (380: 367 single-colour fills, 13 with stops)
+had shape 0 and repeat 0; other shapes and the meaning of repeat values 1
+and 2 are **[inferred]** from CSP's UI order (repeat, flip). CSP sets
+`DrawToRenderOffscreenType` 60, `DrawToRenderMipmapType` 32 and
+`MoveOffsetAndExpandType`, `FixOffsetAndExpandType`,
+`RenderBoundForLayerMoveType`, `SetRenderThumbnailInfoType`,
+`DrawRenderThumbnailType` 30 on these layers.
+
+libclip parses and writes both blobs (`clip_gradation_parse/encode`,
+`CLIP_FILTER_*`) and writes the accompanying columns as above; files written
+this way open in CSP 5.1 **[tested]**.
 
 ### 4.5 `Mipmap`, `MipmapInfo`, `Offscreen`
 
@@ -524,9 +652,12 @@ Paint 5.1 (§8).
    then `Offscreen`. Parse the `Attribute`. Find the chunk whose id equals
    `BlockData`. Inflate each block and place it at
    `(index mod blocksX, index div blocksX) × 256`.
-4. Position the result at `LayerOffset + LayerRenderOffscrOffset`. Apply the
-   mask mipmap if one is present. Composite with `LayerComposite` and
-   `LayerOpacity`. The Paper layer becomes the document's paper colour.
+4. Position the result at `LayerOffset + LayerRenderOffscrOffset`. Read the
+   mask mipmap if one is present (`clip_document_render_layer_mask`); it
+   applies only when `LayerMasking` bit 0 is set. Read `LayerEffectInfo`,
+   `FilterLayerInfo` and `GradationFillInfo` into the layer record. The
+   caller composites with `LayerComposite` and `LayerOpacity`; the Paper
+   layer becomes the document's paper colour.
 5. Verify each block's `BlockCheckSum`, and count mismatches
    (`clip_offscreen_data.checksum_mismatches`).
 
@@ -537,9 +668,18 @@ edge is dropped on a round trip.
 
 * Create CSP's 16 tables, 9 indexes and the `Offscreen` triggers, with the
   `ElemScheme`/`ParamScheme` registry.
-* Write a root folder, an optional Paper layer, and for each raster layer:
-  * a 5-level mipmap chain, with tiles stored for the base level only;
-  * a 512×512 thumbnail offscreen;
+* Write a root folder, an optional Paper layer, and for each layer:
+  * raster layers: a 5-level mipmap chain, with tiles stored for the base
+    level only (Color as alpha + BGRx, Gray as alpha + gray), and a 512×512
+    thumbnail offscreen;
+  * folders: a `Layer` row with `LayerFolder` 17 (open) or 1 (closed) whose
+    children are the following layers of greater depth;
+  * correction and gradient / fill layers: the `FilterLayerInfo` or
+    `GradationFillInfo` blob (§4.4.2) with CSP's accompanying columns, plus
+    the caller's rendering as the base mipmap when given;
+  * an optional layer mask as a second mipmap chain and thumbnail;
+  * `LayerEffectInfo` and the palette-colour columns for Layer Property
+    effects (§4.4.1);
   * `Layer` and `LayerThumbnail` rows with CSP's default values.
 * Compress tiles with libclip's own DEFLATE encoder
   (`src/clip_zlib.c`, level 6) and compute `BlockCheckSum`.
@@ -579,17 +719,17 @@ original. Both CSP and libclip's reader open it.
 
 ## 10. Unknowns and open questions
 
-* **Layer kinds:** `LayerType` values for vector, text, gradient, tone,
-  adjustment and 3-D layers; the formats of `VectorObjectList.VectorData`
-  and the other external columns.
-* **Layer masks:** `LayerLayerMaskMipmap` should follow §5. The mask tile
-  layout (likely alpha-only) has not been seen in a real file.
-* **Other colour modes:** channel orders other than 33 (grey, monochrome,
-  16-bit, CMYK), and `CanvasUnit` values other than 0.
-* **Blend modes:** the `LayerComposite` numbering beyond 0 = Normal.
-* **Unexplained fields:** `BlockStatus`, `LayerMasking` (32 on the root),
-  the `Thumbnail*NeedRefresh*` counters, the two reserved packing words, the
-  constants `20` and `4` in the InitColor section, and `12`/`4` in the
-  BlockSize and trailer headers.
+* **Layer effects:** the payloads of `EffectTone`, `EffectWaterEdge`,
+  `EffectLine` and the other non-border sections of `LayerEffectInfo`.
+* **Layer kinds:** how vector, text, tone and 3-D layers are identified and
+  stored (`VectorObjectList.VectorData` and the other external columns);
+  the parameter layouts of the Posterization and Binarization corrections
+  and of gradient shapes other than linear (§4.4.2).
+* **Other colour modes:** writing the 1-bit monochrome packing (§4.4.1),
+  16-bit and CMYK channel orders, and `CanvasUnit` values other than 0.
+* **Unexplained fields:** `BlockStatus`, `LayerMasking` bit 5 (32 on the
+  root, correction layers and masked folders), the `Thumbnail*NeedRefresh*`
+  counters, the two reserved packing words, the constants `20` and `4` in
+  the InitColor section, and `12`/`4` in the BlockSize and trailer headers.
 * **Multi-page documents:** folders other than the root, animation cels,
   and multi-page `.cmc` projects.

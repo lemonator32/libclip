@@ -76,7 +76,17 @@ static int add_chunk(clip_container *c, const clip_chunk *ch, size_t *cap) {
 static int parse_owned(clip_container *out, clip_error *err) {
     const uint8_t *p = out->file;
     size_t n = out->file_size, pos = K_HEADER_LEN, cap = 0;
-    if (n < K_HEADER_LEN || memcmp(p, kMagic, 8) != 0) return clip__fail(err, "not a CSFCHUNK (.clip) file");
+    if (n >= 100 && memcmp(p, "SQLite format 3", 16) == 0) {
+        /* Legacy .lip: the whole file is the database, with tiles stored inline
+         * in Offscreen.BlockData.  Present it as a single SQLi chunk. */
+        clip_chunk c;
+        memset(&c, 0, sizeof c);
+        memcpy(c.tag, "SQLi", 4);
+        c.size = n;
+        out->bare_sqlite = 1;
+        return add_chunk(out, &c, &cap) ? 1 : clip__fail(err, "out of memory");
+    }
+    if (n < K_HEADER_LEN || memcmp(p, kMagic, 8) != 0) return clip__fail(err, "not a CSFCHUNK (.clip) or SQLite (.lip) file");
     out->declared_file_size = clip__rd_u64be(p + 8);
     out->header_size = clip__rd_u64be(p + 16);
     while (pos + 16 <= n) {

@@ -65,4 +65,9 @@ void clip__image_blit(clip_image *dst, const clip_image *src, int dx, int dy);
 /* Box-filter downscale; dst must be freed by the caller. */
 int clip__image_downscale(const clip_image *src, int w, int h, clip_image *dst);
 
+/* Offscreen encoder.  img == NULL writes an empty offscreen of w x h; `gray`
+ * stores an alpha plane + gray plane (channel order 17) instead of BGRx. */
+int clip__offscreen_encode_ex(const clip_image *img, uint32_t w, uint32_t h, int paper_fill, int gray, clip_buffer *attribute,
+                              clip_buffer *blocks, clip_error *err);
+
 #endif
